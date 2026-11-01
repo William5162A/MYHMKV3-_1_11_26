@@ -1,0 +1,6 @@
+{
+  "name": "مِداد",
+  "description": "منصة مِداد الجامعية لدراسة ومتابعة المواد الدراسية للطلاب والأساتذة",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

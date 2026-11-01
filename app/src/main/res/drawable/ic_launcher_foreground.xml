@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group>
+        <!-- Graduation Cap Diamond (Emerald Mint #34D399) -->
+        <path
+            android:fillColor="#34D399"
+            android:pathData="M54,26 L82,38 L54,50 L26,38 Z" />
+
+        <!-- Cap Headband -->
+        <path
+            android:fillColor="#10B981"
+            android:pathData="M35,43 L35,53 C35,60 73,60 73,53 L73,43 C67,47 41,47 35,43 Z" />
+
+        <!-- Tassel String and Pendant -->
+        <path
+            android:fillColor="#FBBF24"
+            android:pathData="M54,38 L25,48 L24,62 L27,62 L27,49 Z" />
+
+        <!-- Open Book Left Page (Pure White #FFFFFF) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M53,62 C43,59 33,61 28,64 L28,81 C33,78 43,76 53,79 Z" />
+
+        <!-- Open Book Right Page (Pure White #FFFFFF) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M55,62 C65,59 75,61 80,64 L80,81 C75,78 65,76 55,79 Z" />
+
+        <!-- Book Spine Highlight -->
+        <path
+            android:fillColor="#34D399"
+            android:pathData="M53,62 L55,62 L55,79 L53,79 Z" />
+    </group>
+</vector>

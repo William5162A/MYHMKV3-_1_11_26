@@ -24,12 +24,38 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import com.example.data.PdfSecurityStorageService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import java.io.File
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
 enum class UserRole {
     ADMIN,
     STUDENT
+}
+
+/**
+ * حالة ملف الـ PDF المشفر على جهاز المستخدم (المرحلة 2-B3-B2-2B)
+ */
+sealed class LocalPdfStatus {
+    object NotDownloaded : LocalPdfStatus()
+    data class Downloading(
+        val bytesDownloaded: Long,
+        val totalBytes: Long,
+        val progressPercentage: Int
+    ) : LocalPdfStatus()
+    data class Downloaded(
+        val fileSizeBytes: Long
+    ) : LocalPdfStatus()
+    data class Error(
+        val message: String
+    ) : LocalPdfStatus()
 }
 
 data class YearAddedStat(
@@ -43,6 +69,7 @@ data class AppUiState(
     val username: String = "",
     val displayName: String = "",
     val role: UserRole = UserRole.STUDENT,
+    val localPdfStatuses: Map<String, LocalPdfStatus> = emptyMap(),
     val isDarkMode: Boolean = true,
     val currentTab: Int = 0, // 0: الرئيسية, 1: موادي, 2: تصفح المواد, 3: ملفي الشخصي
     val academicYear: Int = 1,
@@ -498,22 +525,68 @@ class AppViewModel : ViewModel() {
         }
     }
 
-    fun logout() {
+    fun logout(context: Context? = null) {
         val session = SessionManager.getSession()
-        viewModelScope.launch {
-            if (session != null) {
-                SupabaseAuthService.signOut(session.accessToken, _uiState.value.supabaseConfig)
+        val currentUserId = session?.userId?.trim().orEmpty()
+
+        // 1. التسلسل الذري تحت القفل المشترك: ضبط راية الخروج وجمع كافة المهام النشطة وإلغاؤها
+        val jobsToCancel: List<Job>
+        synchronized(downloadLifecycleLock) {
+            isLoggingOut.set(true)
+            jobsToCancel = activeDownloadJobs.values.toList()
+            jobsToCancel.forEach { job ->
+                job.cancel(CancellationException("تم إلغاء التنزيل بسبب تسجيل الخروج"))
             }
-            SessionManager.clearSession()
-            _uiState.update {
-                it.copy(
-                    isLoggedIn = false,
-                    username = "",
-                    displayName = "",
-                    currentTab = 0,
-                    selectedSubjectId = null,
-                    loginError = null
-                )
+            activeDownloadJobs.clear()
+        }
+
+        // 2. تشغيل عملية التنظيف على خيط IO مع حماية القسم الحرج بـ NonCancellable
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                withContext(NonCancellable) {
+                    // أ. انتظار اكتمال جميع مهام التنزيل الملغاة لضمان إغلاق التدفقات وتوقف عمليات الكتابة
+                    jobsToCancel.forEach { job ->
+                        try {
+                            job.join()
+                        } catch (_: Exception) {}
+                    }
+
+                    // ب. تنظيف مجلد التخزين المشفر للمستخدم ومجلد العرض المؤقت بعد توقف العمليات
+                    if (context != null && currentUserId.isNotBlank()) {
+                        try {
+                            val safeUserId = currentUserId.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
+                            val baseDir = context.noBackupFilesDir ?: context.filesDir
+                            val secureBase = File(baseDir, "secure_encrypted_pdfs")
+                            val userDir = File(secureBase, safeUserId)
+                            if (userDir.exists()) {
+                                PdfSecurityStorageService.purgeEncryptedStorageDirectory(userDir, secureBase)
+                            }
+                            PdfSecurityStorageService.purgeViewerCacheDirectory(context.cacheDir)
+                        } catch (_: Exception) {}
+                    }
+
+                    // ج. تسجيل الخروج من خادم Supabase ومسح الجلسة محلياً
+                    if (session != null) {
+                        try {
+                            SupabaseAuthService.signOut(session.accessToken, _uiState.value.supabaseConfig)
+                        } catch (_: Exception) {}
+                    }
+                    SessionManager.clearSession()
+                }
+            } finally {
+                // د. تحديث حالة الواجهة لتسجيل الخروج ومسح الحالات فقط بعد اكتمال التنظيف، ثم إعادة ضبط الراية
+                _uiState.update {
+                    it.copy(
+                        isLoggedIn = false,
+                        username = "",
+                        displayName = "",
+                        currentTab = 0,
+                        selectedSubjectId = null,
+                        loginError = null,
+                        localPdfStatuses = emptyMap()
+                    )
+                }
+                isLoggingOut.set(false)
             }
         }
     }
@@ -727,7 +800,7 @@ class AppViewModel : ViewModel() {
      * جلب قائمة ملفات الـ PDF لدرس محدد مع منع الطلبات المتزامنة المتكررة لنفس الدرس
      * (عملية قراءة مستقلة لا تتأثر بحجز عمليات التعديل isPdfOperationLock)
      */
-    fun loadPdfsForLesson(lessonId: String, forceReload: Boolean = false) {
+    fun loadPdfsForLesson(lessonId: String, forceReload: Boolean = false, context: Context? = null) {
         val cleanLessonId = lessonId.trim()
         if (cleanLessonId.isBlank()) return
         val currentState = _uiState.value
@@ -770,6 +843,11 @@ class AppViewModel : ViewModel() {
                             )
                         }
                     )
+                }
+
+                if (result.isSuccess && context != null) {
+                    val pdfList = result.getOrNull().orEmpty()
+                    checkAndSyncLocalPdfStatuses(context, pdfList)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -2391,6 +2469,385 @@ class AppViewModel : ViewModel() {
                 hierarchyOperationMessage = null,
                 hierarchyOperationError = null
             )
+        }
+    }
+
+    // =========================================================================
+    // المرحلة 2-B3-B2-2B: إدارة وتنزيل وحذف ملفات PDF المشفرة محلياً لكل مستخدم
+    // =========================================================================
+
+    private val downloadLifecycleLock = Any()
+    private val activeDownloadJobs = ConcurrentHashMap<String, Job>()
+    private val isLoggingOut = AtomicBoolean(false)
+
+    internal fun isLoggingOut(): Boolean = isLoggingOut.get()
+    internal fun getActiveJobsCount(): Int = activeDownloadJobs.size
+
+    internal fun buildDownloadJobKey(userId: String, pdfId: String): String {
+        return "${userId.trim()}_${pdfId.trim()}"
+    }
+
+    internal fun getUserEncryptedStorageDir(context: Context, userId: String): File {
+        val cleanUserId = userId.trim()
+        require(cleanUserId.isNotBlank()) { "معرف المستخدم غير صالح" }
+        val safeUserId = cleanUserId.replace("[^a-zA-Z0-9_-]".toRegex(), "_")
+        val baseDir = context.noBackupFilesDir ?: context.filesDir
+        val securePdfsDir = File(baseDir, "secure_encrypted_pdfs")
+        val userDir = File(securePdfsDir, safeUserId)
+        if (!userDir.exists()) {
+            userDir.mkdirs()
+        }
+        return userDir
+    }
+
+    internal fun getLocalEncryptedPdfFile(context: Context, userId: String, pdfId: String): File {
+        val cleanPdfId = pdfId.trim()
+        try {
+            UUID.fromString(cleanPdfId)
+        } catch (e: IllegalArgumentException) {
+            throw IllegalArgumentException("معرف ملف الـ PDF غير صالح (ليس UUID صالحًا): $cleanPdfId")
+        }
+        val userDir = getUserEncryptedStorageDir(context, userId)
+        val fileName = "$cleanPdfId.pdf.enc"
+        val targetFile = File(userDir, fileName)
+        val targetCanonical = targetFile.canonicalPath
+        val userDirCanonical = userDir.canonicalPath
+        if (!targetCanonical.startsWith(userDirCanonical + File.separator)) {
+            throw SecurityException("مسار الملف غير آمن (محاولة تخطي مجلد المستخدم)")
+        }
+        return targetFile
+    }
+
+    /**
+     * تنزيل ملف الـ PDF الموثق من مساحة التخزين الخاصة في Supabase وتشفيره تدفقياً ومباشرة
+     * وحفظه في مجلد معزول للمستخدم الحالي دون كتابة أي بايت مكشوف على القرص
+     */
+    fun downloadLessonPdf(context: Context, pdf: LessonPdf) {
+        val cleanPdfId = pdf.id.trim()
+        val cleanFilePath = pdf.filePath.trim()
+
+        // 1. التحقق من صلاحية معرف الـ PDF كـ UUID صالح
+        try {
+            UUID.fromString(cleanPdfId)
+        } catch (_: IllegalArgumentException) {
+            _uiState.update { state ->
+                val updated = state.localPdfStatuses.toMutableMap()
+                updated[cleanPdfId] = LocalPdfStatus.Error("معرف ملف الـ PDF غير صالح (يجب أن يكون UUID)")
+                state.copy(localPdfStatuses = updated)
+            }
+            return
+        }
+
+        if (cleanFilePath.isBlank()) {
+            _uiState.update { state ->
+                val updated = state.localPdfStatuses.toMutableMap()
+                updated[cleanPdfId] = LocalPdfStatus.Error("مسار الملف على الخادم غير محدد")
+                state.copy(localPdfStatuses = updated)
+            }
+            return
+        }
+
+        // 2. التحقق من جلسة المستخدم واستخراج userId
+        val currentSession = SessionManager.getSession()
+        val sessionUserId = currentSession?.userId?.trim().orEmpty()
+        if (sessionUserId.isBlank()) {
+            _uiState.update { state ->
+                val updated = state.localPdfStatuses.toMutableMap()
+                updated[cleanPdfId] = LocalPdfStatus.Error("يجب تسجيل الدخول أولاً لتنزيل الملف")
+                state.copy(localPdfStatuses = updated)
+            }
+            return
+        }
+
+        val targetFile = try {
+            getLocalEncryptedPdfFile(context, sessionUserId, cleanPdfId)
+        } catch (e: Exception) {
+            _uiState.update { state ->
+                val updated = state.localPdfStatuses.toMutableMap()
+                updated[cleanPdfId] = LocalPdfStatus.Error(e.message ?: "مسار التخزين غير صالح")
+                state.copy(localPdfStatuses = updated)
+            }
+            return
+        }
+
+        // 3. التحقق من وجود نسخة محلية مشفرة صالحة مسبقاً
+        if (PdfSecurityStorageService.isEncryptedFilePresent(targetFile)) {
+            _uiState.update { state ->
+                val updated = state.localPdfStatuses.toMutableMap()
+                updated[cleanPdfId] = LocalPdfStatus.Downloaded(targetFile.length())
+                state.copy(localPdfStatuses = updated)
+            }
+            return
+        }
+
+        // 4. الحجز الذري المتسلسل تحت القفل المشترك لمنع التسابق مع تسجيل الخروج أو بدء مهمة أخرى
+        val jobKey = buildDownloadJobKey(sessionUserId, cleanPdfId)
+        lateinit var createdJob: Job
+        var isReserved = false
+
+        synchronized(downloadLifecycleLock) {
+            if (isLoggingOut.get()) {
+                return
+            }
+
+            createdJob = viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
+                try {
+                    val tokenRes = getValidAccessToken()
+                    if (tokenRes.isFailure) {
+                        val err = tokenRes.exceptionOrNull()?.message ?: "انتهت صلاحية الجلسة"
+                        val curr = SessionManager.getSession()
+                        if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                            _uiState.update { state ->
+                                val updated = state.localPdfStatuses.toMutableMap()
+                                updated[cleanPdfId] = LocalPdfStatus.Error(err)
+                                state.copy(localPdfStatuses = updated)
+                            }
+                        }
+                        return@launch
+                    }
+                    val token = tokenRes.getOrThrow()
+                    val config = _uiState.value.supabaseConfig
+
+                    var lastEmittedPercentage = -1
+                    var lastEmittedTimeMs = 0L
+
+                    val downloadResult = SupabaseStorageService.downloadAndEncryptAuthenticatedPdf(
+                        filePath = cleanFilePath,
+                        accessToken = token,
+                        destinationEncryptedFile = targetFile,
+                        config = config,
+                        onProgress = { bytesRead, totalBytes ->
+                            val percentage = if (totalBytes > 0) {
+                                ((bytesRead * 100) / totalBytes).toInt().coerceIn(0, 100)
+                            } else {
+                                0
+                            }
+                            val now = System.currentTimeMillis()
+                            if (percentage != lastEmittedPercentage || now - lastEmittedTimeMs >= 150L) {
+                                lastEmittedPercentage = percentage
+                                lastEmittedTimeMs = now
+                                val curr = SessionManager.getSession()
+                                if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                                    _uiState.update { state ->
+                                        val updated = state.localPdfStatuses.toMutableMap()
+                                        updated[cleanPdfId] = LocalPdfStatus.Downloading(
+                                            bytesDownloaded = bytesRead,
+                                            totalBytes = totalBytes,
+                                            progressPercentage = percentage
+                                        )
+                                        state.copy(localPdfStatuses = updated)
+                                    }
+                                }
+                            }
+                        }
+                    )
+
+                    // التحقق بعد عودة الدالة من أن الجلسة ما زالت تخص نفس المستخدم وأن عملية تسجيل الخروج ليست جارية
+                    val postSession = SessionManager.getSession()
+                    if (postSession?.userId?.trim() != sessionUserId || isLoggingOut.get()) {
+                        if (targetFile.exists()) {
+                            try {
+                                val userSecureDir = getUserEncryptedStorageDir(context, sessionUserId)
+                                PdfSecurityStorageService.deleteSecureFile(targetFile, userSecureDir)
+                            } catch (_: Exception) {
+                                targetFile.delete()
+                            }
+                        }
+                        _uiState.update { state ->
+                            val updated = state.localPdfStatuses.toMutableMap()
+                            updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+                            state.copy(localPdfStatuses = updated)
+                        }
+                        return@launch
+                    }
+
+                    if (downloadResult.isSuccess) {
+                        val file = downloadResult.getOrThrow()
+                        if (PdfSecurityStorageService.isEncryptedFilePresent(file)) {
+                            val curr = SessionManager.getSession()
+                            if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                                _uiState.update { state ->
+                                    val updated = state.localPdfStatuses.toMutableMap()
+                                    updated[cleanPdfId] = LocalPdfStatus.Downloaded(file.length())
+                                    state.copy(localPdfStatuses = updated)
+                                }
+                            }
+                        } else {
+                            val curr = SessionManager.getSession()
+                            if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                                _uiState.update { state ->
+                                    val updated = state.localPdfStatuses.toMutableMap()
+                                    updated[cleanPdfId] = LocalPdfStatus.Error("الملف المشفر الناتج غير صالح أو تالف")
+                                    state.copy(localPdfStatuses = updated)
+                                }
+                            }
+                        }
+                    } else {
+                        val curr = SessionManager.getSession()
+                        if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                            val err = downloadResult.exceptionOrNull()
+                            _uiState.update { state ->
+                                val updated = state.localPdfStatuses.toMutableMap()
+                                updated[cleanPdfId] = LocalPdfStatus.Error(err?.message ?: "فشل تنزيل وتشفير الملف")
+                                state.copy(localPdfStatuses = updated)
+                            }
+                        } else {
+                            _uiState.update { state ->
+                                val updated = state.localPdfStatuses.toMutableMap()
+                                updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+                                state.copy(localPdfStatuses = updated)
+                            }
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    if (targetFile.exists()) {
+                        try {
+                            val userSecureDir = getUserEncryptedStorageDir(context, sessionUserId)
+                            PdfSecurityStorageService.deleteSecureFile(targetFile, userSecureDir)
+                        } catch (_: Exception) {
+                            targetFile.delete()
+                        }
+                    }
+                    _uiState.update { state ->
+                        val updated = state.localPdfStatuses.toMutableMap()
+                        updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+                        state.copy(localPdfStatuses = updated)
+                    }
+                    throw e
+                } catch (e: Exception) {
+                    if (targetFile.exists()) {
+                        try {
+                            val userSecureDir = getUserEncryptedStorageDir(context, sessionUserId)
+                            PdfSecurityStorageService.deleteSecureFile(targetFile, userSecureDir)
+                        } catch (_: Exception) {
+                            targetFile.delete()
+                        }
+                    }
+                    val curr = SessionManager.getSession()
+                    if (curr?.userId?.trim() == sessionUserId && !isLoggingOut.get()) {
+                        _uiState.update { state ->
+                            val updated = state.localPdfStatuses.toMutableMap()
+                            updated[cleanPdfId] = LocalPdfStatus.Error(e.message ?: "حدث خطأ غير متوقع أثناء التنزيل")
+                            state.copy(localPdfStatuses = updated)
+                        }
+                    } else {
+                        _uiState.update { state ->
+                            val updated = state.localPdfStatuses.toMutableMap()
+                            updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+                            state.copy(localPdfStatuses = updated)
+                        }
+                    }
+                } finally {
+                    // إزالة مشروطة بهوية المهمة الدقيقة لعدم مسح أي مهمة جديدة بديلة
+                    activeDownloadJobs.remove(jobKey, createdJob)
+                }
+            }
+
+            val existing = activeDownloadJobs.putIfAbsent(jobKey, createdJob)
+            if (existing == null) {
+                isReserved = true
+            } else {
+                createdJob.cancel()
+            }
+        }
+
+        if (!isReserved) {
+            return
+        }
+
+        // بدء المهمة وتعيين الحالة الابتدائية إلى Downloading
+        _uiState.update { state ->
+            val updated = state.localPdfStatuses.toMutableMap()
+            updated[cleanPdfId] = LocalPdfStatus.Downloading(0L, -1L, 0)
+            state.copy(localPdfStatuses = updated)
+        }
+
+        createdJob.start()
+    }
+
+    /**
+     * إلغاء تنزيل ملف الـ PDF الجاري وإلغاء طلب الشبكة فوراً وتنظيف أي ملفات مؤقتة
+     * مع التقيد الصارم بمعرف المستخدم الحالي لمنع إلغاء مهام مستخدمين آخرين
+     * ودون إزالة المهمة يدوياً من خريطة المهام النشطة لضمان انتهاء التنظيف أولاً
+     */
+    fun cancelLessonPdfDownload(pdfId: String) {
+        val cleanPdfId = pdfId.trim()
+        val currentUserId = SessionManager.getSession()?.userId?.trim().orEmpty()
+        if (currentUserId.isBlank()) return
+
+        val specificKey = buildDownloadJobKey(currentUserId, cleanPdfId)
+        val activeJob = activeDownloadJobs[specificKey]
+
+        if (activeJob != null) {
+            activeJob.cancel(CancellationException("تم إلغاء تنزيل الملف بواسطة المستخدم"))
+            // لا نحذف المهمة يدوياً من activeDownloadJobs، بل تترك لتزيل نفسها داخل finally
+            // بعد اكتمال تنظيف الملف وحذفه لضمان عدم تسابق أي طلب تنزيل جديد
+        }
+
+        _uiState.update { state ->
+            val updated = state.localPdfStatuses.toMutableMap()
+            updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+            state.copy(localPdfStatuses = updated)
+        }
+    }
+
+    /**
+     * حذف النسخة المشفرة المحلية للملف فقط دون أي استدعاء لخادم أو قاعدة بيانات Supabase
+     */
+    fun deleteLocalSecurePdf(context: Context, pdf: LessonPdf) {
+        val cleanPdfId = pdf.id.trim()
+        // أولاً: إلغاء التنزيل الجاري للملف إن وجد
+        cancelLessonPdfDownload(cleanPdfId)
+
+        val currentUserId = SessionManager.getSession()?.userId?.trim().orEmpty()
+        if (currentUserId.isNotBlank()) {
+            try {
+                val targetFile = getLocalEncryptedPdfFile(context, currentUserId, cleanPdfId)
+                if (targetFile.exists()) {
+                    val userSecureDir = getUserEncryptedStorageDir(context, currentUserId)
+                    PdfSecurityStorageService.deleteSecureFile(targetFile, userSecureDir)
+                }
+            } catch (_: Exception) {}
+        }
+
+        _uiState.update { state ->
+            val updated = state.localPdfStatuses.toMutableMap()
+            updated[cleanPdfId] = LocalPdfStatus.NotDownloaded
+            state.copy(localPdfStatuses = updated)
+        }
+    }
+
+    /**
+     * التحقق من الملفات المشفرة المخزنة محلياً لدروس المادة ومزامنة حالتها في AppUiState
+     * لمجلد المستخدم الحالي فقط
+     */
+    fun checkAndSyncLocalPdfStatuses(context: Context, pdfs: List<LessonPdf>) {
+        val currentUserId = SessionManager.getSession()?.userId?.trim().orEmpty()
+        if (currentUserId.isBlank()) return
+
+        val newStatuses = mutableMapOf<String, LocalPdfStatus>()
+        for (pdf in pdfs) {
+            val cleanId = pdf.id.trim()
+            try {
+                UUID.fromString(cleanId)
+                val file = getLocalEncryptedPdfFile(context, currentUserId, cleanId)
+                if (PdfSecurityStorageService.isEncryptedFilePresent(file)) {
+                    newStatuses[cleanId] = LocalPdfStatus.Downloaded(file.length())
+                } else {
+                    val jobKey = buildDownloadJobKey(currentUserId, cleanId)
+                    if (!activeDownloadJobs.containsKey(jobKey)) {
+                        newStatuses[cleanId] = LocalPdfStatus.NotDownloaded
+                    }
+                }
+            } catch (_: Exception) {
+                // تجاوز المعرفات غير المطابقة لـ UUID
+            }
+        }
+
+        if (newStatuses.isNotEmpty()) {
+            _uiState.update { state ->
+                state.copy(localPdfStatuses = state.localPdfStatuses + newStatuses)
+            }
         }
     }
 }

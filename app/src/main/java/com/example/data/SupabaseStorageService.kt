@@ -6,7 +6,12 @@ import android.provider.OpenableColumns
 import android.util.Log
 import com.example.model.SupabaseConfig
 import com.example.model.TopicAttachment
+import androidx.annotation.VisibleForTesting
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.InternalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
@@ -18,7 +23,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
+import java.net.SocketTimeoutException
 import java.net.URLEncoder
+import java.net.UnknownHostException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -38,13 +45,19 @@ object SupabaseStorageService {
     private const val TAG = "SupabaseStorage"
     private const val MAX_FILE_SIZE_BYTES = 50L * 1024L * 1024L // 50MB
 
-    private val client: OkHttpClient by lazy {
+    private val defaultClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
             .build()
     }
+
+    @Volatile
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    internal var testClient: OkHttpClient? = null
+
+    private fun getClient(): OkHttpClient = testClient ?: defaultClient
 
     private fun isConfigured(config: SupabaseConfig): Boolean {
         val cleanUrl = config.projectUrl.trim().trimEnd('/')
@@ -126,7 +139,7 @@ object SupabaseStorageService {
                 .post(requestBody)
                 .build()
 
-            val response = client.newCall(request).execute()
+            val response = getClient().newCall(request).execute()
             val responseBody = response.body?.string().orEmpty()
 
             if (response.isSuccessful || response.code in 200..299) {
@@ -156,12 +169,152 @@ object SupabaseStorageService {
     }
 
     // =========================================================================
-    // 2. Private Storage: Authenticated Direct Download (تنزيل موثق مباشر)
+    // 2. Private Storage: Authenticated Direct Download & Direct Encryption
     // =========================================================================
 
     /**
+     * تنزيل موثق لملف PDF من الـ Private Bucket وتشفيره تدفقياً ومباشرة عبر AES-256-GCM
+     * دون كتابة أي بايت PDF مكشوف على قرص التخزين نهائياً.
+     *
+     * @param filePath مسار الملف النسبي في الـ Private Bucket
+     * @param destinationEncryptedFile الملف المشفر النهائي المستهدف (.enc)
+     * @param accessToken رمز الوصول الموثق (JWT)
+     * @param config إعدادات Supabase (الرابط، مفتاح anon، اسم الـ Bucket)
+     * @param onProgress دالة إشعار تقدم القراءة والتشفير (bytesRead, totalBytes)
+     */
+    suspend fun downloadAndEncryptAuthenticatedPdf(
+        filePath: String,
+        accessToken: String,
+        destinationEncryptedFile: File,
+        config: SupabaseConfig = SupabaseConfig(),
+        onProgress: ((bytesRead: Long, totalBytes: Long) -> Unit)? = null
+    ): Result<File> = withContext(Dispatchers.IO) {
+        if (!isConfigured(config)) {
+            return@withContext Result.failure(IllegalArgumentException("إعدادات Supabase غير مهيأة بعد"))
+        }
+        val cleanToken = accessToken.trim()
+        if (cleanToken.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("رمز الوصول (accessToken) مطلوب لتنزيل وتشفير الملفات"))
+        }
+        val cleanPath = filePath.trim()
+        if (cleanPath.isBlank()) {
+            return@withContext Result.failure(IllegalArgumentException("مسار الملف غير محدد"))
+        }
+
+        try {
+            val encodedPath = encodeStoragePath(cleanPath)
+            val cleanUrl = config.projectUrl.trim().trimEnd('/')
+            val endpoint = "$cleanUrl/storage/v1/object/authenticated/${config.bucketName}/$encodedPath"
+
+            val request = Request.Builder()
+                .url(endpoint)
+                .addHeader("apikey", config.anonKey.trim())
+                .addHeader("Authorization", "Bearer $cleanToken")
+                .addHeader("Accept", "application/pdf, application/octet-stream")
+                .get()
+                .build()
+
+            val call = getClient().newCall(request)
+
+            // ربط إلغاء الكوروتين بإلغاء اتصال OkHttp Call فعلياً وبشكل لحظي
+            @OptIn(InternalCoroutinesApi::class)
+            val cancellationHandle = coroutineContext[Job]?.invokeOnCompletion(
+                onCancelling = true,
+                invokeImmediately = false
+            ) { cause ->
+                if (cause != null) {
+                    try {
+                        call.cancel()
+                    } catch (_: Throwable) {}
+                }
+            }
+
+            try {
+                val response = try {
+                    call.execute()
+                } catch (e: IOException) {
+                    if (call.isCanceled() || !coroutineContext.isActive) {
+                        throw CancellationException("تم إلغاء اتصال الشبكة لتنزيل الملف", e)
+                    }
+                    throw e
+                }
+
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        val errBody = resp.body?.string().orEmpty()
+                        val errorMsg = mapStorageHttpError(resp.code, "تنزيل وتشفير الملف", errBody)
+                        Log.w(TAG, errorMsg)
+                        return@withContext Result.failure(IOException(errorMsg))
+                    }
+
+                    val body = resp.body
+                        ?: return@withContext Result.failure(IOException("استجابة الخادم فارغة"))
+
+                    // التحقق من ترويسة Content-Type دون الاعتماد عليها وحدها
+                    val contentType = resp.header("Content-Type").orEmpty()
+                    if (contentType.contains("json", ignoreCase = true)) {
+                        val jsonBody = body.string()
+                        return@withContext Result.failure(IOException("استجاب الخادم برسالة خطأ بدلاً من الملف: $jsonBody"))
+                    }
+
+                    val totalBytes = body.contentLength()
+                    if (totalBytes > MAX_FILE_SIZE_BYTES) {
+                        return@withContext Result.failure(
+                            IllegalArgumentException("حجم الملف في ترويسة الخادم ($totalBytes بايت) يتجاوز الحد الأقصى المسموح به (50 ميغابايت)")
+                        )
+                    }
+
+                    // تمرير دفق InputStream مباشرة إلى خدمة التشفير دون كتابة نسخة مكشوفة على القرص
+                    val encryptResult = body.byteStream().use { stream ->
+                        PdfSecurityStorageService.encryptStream(
+                            inputStream = stream,
+                            destinationEncryptedFile = destinationEncryptedFile,
+                            maxAllowedSizeBytes = MAX_FILE_SIZE_BYTES,
+                            totalBytesExpected = totalBytes,
+                            onProgress = onProgress
+                        )
+                    }
+
+                    // التحقق من حالة الإلغاء فور عودة نتيجة التشفير للتمييز بين الإلغاء والفشل العادي
+                    if (call.isCanceled() || !coroutineContext.isActive) {
+                        if (destinationEncryptedFile.exists()) {
+                            destinationEncryptedFile.delete()
+                        }
+                        throw CancellationException("تم إلغاء تنزيل وتشفير الملف")
+                    }
+
+                    if (encryptResult.isFailure) {
+                        val cause = encryptResult.exceptionOrNull()
+                            ?: IOException("فشل تشفير الملف أثناء التنزيل التدفقي")
+                        return@withContext Result.failure(cause)
+                    }
+
+                    Result.success(destinationEncryptedFile)
+                }
+            } finally {
+                cancellationHandle?.dispose()
+            }
+        } catch (e: CancellationException) {
+            if (destinationEncryptedFile.exists()) {
+                destinationEncryptedFile.delete()
+            }
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during downloadAndEncryptAuthenticatedPdf", e)
+            val friendlyMsg = when (e) {
+                is UnknownHostException -> "تعذر الاتصال بالخادم، يرجى التحقق من اتصال الإنترنت"
+                is SocketTimeoutException -> "انتهت مهلة الاتصال بالخادم أثناء تنزيل الملف"
+                is IllegalArgumentException -> e.message ?: "معاملات تنزيل وتشفير الملف غير صالحة"
+                is IOException -> e.message ?: "حدث خطأ أثناء نقل وتشفير الملف من الخادم"
+                else -> e.message ?: "فشل تنزيل وتشفير الملف"
+            }
+            Result.failure(Exception(friendlyMsg, e))
+        }
+    }
+
+    /**
      * تنزيل ملف PDF مباشرة من الـ Private Bucket عبر مسار التوثيق المباشر
-     * وكتابته تدريجياً في destinationFile دون استهلاك الذاكرة
+     * وكتابته تدريجياً في destinationFile دون استهلاك الذاكرة (للتوافق مع الاستدعاءات القائمة)
      */
     suspend fun downloadAuthenticatedPdf(
         filePath: String,
@@ -193,7 +346,7 @@ object SupabaseStorageService {
                 .get()
                 .build()
 
-            val response = client.newCall(request).execute()
+            val response = getClient().newCall(request).execute()
 
             if (!response.isSuccessful) {
                 val errBody = response.body?.string().orEmpty()
@@ -313,7 +466,7 @@ object SupabaseStorageService {
                 .delete(requestBody)
                 .build()
 
-            val response = client.newCall(request).execute()
+            val response = getClient().newCall(request).execute()
             val responseBody = response.body?.string().orEmpty()
 
             if (response.isSuccessful || response.code in 200..299) {

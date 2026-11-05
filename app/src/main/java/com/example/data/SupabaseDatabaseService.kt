@@ -9,6 +9,7 @@ import com.example.model.CourseUnit
 import com.example.model.LessonPdf
 import com.example.model.Semester
 import com.example.model.Subject
+import com.example.model.SubjectEnrollment
 import com.example.model.SupabaseConfig
 import com.example.model.TopicAttachment
 import kotlinx.coroutines.Dispatchers
@@ -24,13 +25,20 @@ import java.util.concurrent.TimeUnit
 object SupabaseDatabaseService {
     private const val TAG = "SupabaseDbService"
 
-    private val client: OkHttpClient by lazy {
+    private val defaultClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
             .build()
     }
+
+    @Volatile
+    @androidx.annotation.VisibleForTesting(otherwise = androidx.annotation.VisibleForTesting.PRIVATE)
+    internal var testClient: OkHttpClient? = null
+
+    private val client: OkHttpClient
+        get() = testClient ?: defaultClient
 
     fun isConfigured(config: SupabaseConfig): Boolean {
         val cleanUrl = config.projectUrl.trim().trimEnd('/')
@@ -1421,6 +1429,74 @@ object SupabaseDatabaseService {
         }
     }
 
+    /**
+     * تحديث البيانات الوصفية لملف PDF في جدول public.lesson_pdfs
+     * يرسل title و is_published و order_index فقط باستخدام PATCH و Prefer: return=representation
+     */
+    suspend fun updateLessonPdf(
+        pdfId: String,
+        title: String,
+        isPublished: Boolean,
+        orderIndex: Int,
+        accessToken: String,
+        config: SupabaseConfig = SupabaseConfig()
+    ): Result<LessonPdf> = withContext(Dispatchers.IO) {
+        if (!isConfigured(config)) {
+            return@withContext Result.failure(Exception("إعدادات Supabase غير مهيأة بعد"))
+        }
+        if (accessToken.isBlank()) {
+            return@withContext Result.failure(Exception("رمز الوصول (accessToken) مطلوب لتحديث بيانات ملف الدرس"))
+        }
+        val cleanId = pdfId.trim()
+        if (cleanId.isBlank()) {
+            return@withContext Result.failure(Exception("معرف السجل (pdfId) مطلوب ولا يمكن أن يكون فارغاً"))
+        }
+        val cleanTitle = title.trim()
+        if (cleanTitle.isBlank()) {
+            return@withContext Result.failure(Exception("عنوان ملف الـ PDF مطلوب ولا يمكن أن يكون فارغاً"))
+        }
+
+        try {
+            val cleanUrl = config.projectUrl.trim().trimEnd('/')
+            val endpoint = "$cleanUrl/rest/v1/lesson_pdfs?id=eq.$cleanId"
+
+            val jsonBody = JSONObject().apply {
+                put("title", cleanTitle)
+                put("is_published", isPublished)
+                put("order_index", orderIndex)
+            }
+
+            val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
+            val request = Request.Builder()
+                .url(endpoint)
+                .addHeader("apikey", config.anonKey.trim())
+                .addHeader("Authorization", "Bearer ${accessToken.trim()}")
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Prefer", "return=representation")
+                .patch(requestBody)
+                .build()
+
+            client.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                if (response.isSuccessful || response.code in 200..299) {
+                    val updated = parseSingleRepresentation(responseBody, ::parseLessonPdf)
+                    if (updated != null) {
+                        Result.success(updated)
+                    } else {
+                        Result.failure(Exception("لم يتم العثور على سجل الملف المطلوب أو لا تملك الصلاحية الكافية لتحديثه"))
+                    }
+                } else {
+                    val errorMsg = mapHttpError(response.code, "تحديث بيانات ملف الدرس", responseBody)
+                    Log.w(TAG, errorMsg)
+                    Result.failure(Exception(errorMsg))
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception in updateLessonPdf", e)
+            Result.failure(mapNetworkException(e, "فشل تحديث بيانات ملف الدرس"))
+        }
+    }
+
     // -------------------------------------------------------------------------
     // 3.5 Parsers & Error Mapping Helpers
     // -------------------------------------------------------------------------
@@ -1517,6 +1593,73 @@ object SupabaseDatabaseService {
             e.message ?: fallbackMsg
         }
         return Exception(friendlyMsg, e)
+    }
+    // =========================================================================
+    // 7. Student Subject Enrollments (اشتراكات الطلاب في المواد)
+    // =========================================================================
+
+    /**
+     * جلب اشتراكات الطالب الفعلية للمستخدم الموثق حالياً من جدول public.subject_enrollments
+     * وفق سياسات RLS: PostgREST يعيد فقط السجلات المرتبطة بـ auth.uid() == user_id
+     */
+    suspend fun fetchUserEnrollments(
+        accessToken: String,
+        config: SupabaseConfig = SupabaseConfig()
+    ): Result<List<SubjectEnrollment>> = withContext(Dispatchers.IO) {
+        if (!isConfigured(config)) {
+            return@withContext Result.failure(Exception("إعدادات Supabase غير مهيأة بعد"))
+        }
+
+        val cleanToken = accessToken.trim()
+        if (cleanToken.isBlank()) {
+            return@withContext Result.failure(Exception("يتطلب الوصول إلى جدول الاشتراكات جلسة مسجلة صالحة"))
+        }
+
+        try {
+            val cleanUrl = config.projectUrl.trim().trimEnd('/')
+            val endpoint = "$cleanUrl/rest/v1/subject_enrollments?select=*&order=created_at.desc"
+
+            val request = Request.Builder()
+                .url(endpoint)
+                .addHeader("apikey", config.anonKey.trim())
+                .addHeader("Authorization", "Bearer $cleanToken")
+                .addHeader("Accept", "application/json")
+                .get()
+                .build()
+
+            val response = client.newCall(request).execute()
+            val responseBody = response.body?.string().orEmpty()
+
+            if (response.isSuccessful) {
+                val jsonArray = JSONArray(responseBody)
+                val list = mutableListOf<SubjectEnrollment>()
+                for (i in 0 until jsonArray.length()) {
+                    val obj = jsonArray.getJSONObject(i)
+                    list.add(parseSubjectEnrollment(obj))
+                }
+                Result.success(list)
+            } else {
+                val errorMsg = mapHttpError(response.code, "جلب اشتراكات الطالب", responseBody)
+                Log.w(TAG, "$errorMsg - $responseBody")
+                Result.failure(Exception(errorMsg))
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception in fetchUserEnrollments", e)
+            Result.failure(mapNetworkException(e, "فشل جلب الاشتراكات من الخادم"))
+        }
+    }
+
+    internal fun parseSubjectEnrollment(obj: JSONObject): SubjectEnrollment {
+        return SubjectEnrollment(
+            id = obj.optString("id"),
+            userId = obj.optString("user_id"),
+            subjectId = obj.optString("subject_id"),
+            purchaseId = if (obj.isNull("purchase_id")) null else obj.optString("purchase_id").ifBlank { null },
+            purchasedAt = obj.optString("purchased_at"),
+            expiresAt = if (obj.isNull("expires_at")) null else obj.optString("expires_at").ifBlank { null },
+            createdAt = obj.optString("created_at"),
+            updatedAt = obj.optString("updated_at")
+        )
     }
 }
 

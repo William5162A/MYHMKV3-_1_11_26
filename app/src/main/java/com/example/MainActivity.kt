@@ -34,12 +34,14 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.model.CurriculumData
+import com.example.data.PdfSecurityStorageService
 import com.example.ui.screens.BrowseCoursesScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.LoginScreen
 import com.example.ui.screens.MyCoursesScreen
 import com.example.ui.screens.ProfileScreen
 import com.example.ui.screens.RegisterScreen
+import com.example.ui.screens.SecurePdfViewerScreen
 import com.example.ui.screens.SubjectDetailScreen
 import com.example.ui.theme.CairoFontFamily
 import com.example.ui.theme.DeepNavy
@@ -60,6 +62,11 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         handleAuthIntent(intent)
 
+        // تنظيف الملفات المؤقتة اليتيمة من جلسات سابقة غير مكتملة عند بدء التشغيل الجديد فقط
+        if (savedInstanceState == null && appViewModel.uiState.value.activePdfSession == null) {
+            PdfSecurityStorageService.purgeViewerCacheDirectory(cacheDir)
+        }
+
         setContent {
             val viewModel: AppViewModel = appViewModel
             val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -71,7 +78,14 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.fillMaxSize(),
                         color = MaterialTheme.colorScheme.background
                     ) {
-                        if (!state.isLoggedIn) {
+                        val activePdfSession = state.activePdfSession
+                        if (activePdfSession != null) {
+                            SecurePdfViewerScreen(
+                                session = activePdfSession,
+                                onClose = { viewModel.closeLessonPdf(this@MainActivity) },
+                                isDarkMode = state.isDarkMode
+                            )
+                        } else if (!state.isLoggedIn) {
                             var isRegistering by rememberSaveable { mutableStateOf(false) }
 
                             if (isRegistering) {

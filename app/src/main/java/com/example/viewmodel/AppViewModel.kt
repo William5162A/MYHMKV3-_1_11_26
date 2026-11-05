@@ -30,10 +30,12 @@ import kotlinx.coroutines.withContext
 import com.example.data.PdfSecurityStorageService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import android.util.Log
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 enum class UserRole {
     ADMIN,
@@ -63,6 +65,16 @@ data class YearAddedStat(
     val count: Int
 )
 
+/**
+ * بيانات جلسة عرض ملف الـ PDF المفتوح حالياً داخل التطبيق (المرحلة 2-C-1)
+ */
+data class ActivePdfSession(
+    val pdf: LessonPdf,
+    val decryptedTempFile: File,
+    val decryptedTempFilePath: String = decryptedTempFile.absolutePath,
+    val openedAtMs: Long = System.currentTimeMillis()
+)
+
 data class AppUiState(
     val isLoggedIn: Boolean = false,
     val isLoggingIn: Boolean = false,
@@ -70,11 +82,17 @@ data class AppUiState(
     val displayName: String = "",
     val role: UserRole = UserRole.STUDENT,
     val localPdfStatuses: Map<String, LocalPdfStatus> = emptyMap(),
+    // حالة جلسة عرض الـ PDF المفتوح حالياً (المرحلة 2-C-1)
+    val activePdfSession: ActivePdfSession? = null,
+    val isOpeningPdf: Boolean = false,
+    val pdfViewerError: String? = null,
     val isDarkMode: Boolean = true,
     val currentTab: Int = 0, // 0: الرئيسية, 1: موادي, 2: تصفح المواد, 3: ملفي الشخصي
     val academicYear: Int = 1,
     val semester: Int = 1,
-    val enrolledSubjectIds: Set<String> = emptySet(), // Starts empty, populated when subjects are enrolled/published
+    val enrolledSubjectIds: Set<String> = emptySet(), // Starts empty, populated from real Supabase enrollments
+    val isEnrollmentsLoaded: Boolean = false,
+    val enrollmentsError: String? = null,
     val completedTopicIds: Set<String> = emptySet(), // Starts empty, no fake mock completions
     val selectedSubjectId: String? = null, // Opened subject for detail view
     val searchQuery: String = "",
@@ -160,8 +178,16 @@ class AppViewModel : ViewModel() {
 
     // قفل ذري لمنع تداخل عمليات تعديل ملفات الـ PDF (الرفع والحذف وإعادة المحاولة)
     private val isPdfOperationLock = AtomicBoolean(false)
+    // قفل ذري لمنع تداخل فتح ملفات الـ PDF للعرض (المرحلة 2-C-1)
+    private val isOpeningPdfLock = AtomicBoolean(false)
+    // تتبع معرفات ملفات الـ PDF الجاري تحديثها لمنع تكرار التحديث المتزامن لنفس الملف
+    private val updatingPdfIds = ConcurrentHashMap.newKeySet<String>()
     // قفل ذري لمنع تداخل عمليات تعديل الهيكلية التعليمية (الوحدات والفصول والدروس)
     private val isHierarchyOperationLock = AtomicBoolean(false)
+    // قفل ذري وتتبع لتسلسل عمليات المزامنة مع Supabase لمنع سباق البيانات والتداخل مع تسجيل الخروج وتبديل المستخدمين (المرحلة 2-C-1-R)
+    private val syncExecutionLock = Any()
+    private var activeSyncJob: Job? = null
+    private val syncSequenceCounter = AtomicLong(0)
 
     // تتبع عمليات النقل والإضافة المحلية للدروس لحمايتها من استجابات التحميل غير المكتملة أو القديمة
     private data class RecentLessonTransfer(
@@ -180,7 +206,14 @@ class AppViewModel : ViewModel() {
     fun restoreOrRefreshSession() {
         val session = SessionManager.getSession()
         if (session == null || session.accessToken.isBlank()) {
-            _uiState.update { it.copy(isSubjectsLoaded = true) }
+            _uiState.update {
+                it.copy(
+                    isSubjectsLoaded = true,
+                    enrolledSubjectIds = emptySet(),
+                    isEnrollmentsLoaded = false,
+                    enrollmentsError = null
+                )
+            }
             return
         }
 
@@ -201,7 +234,10 @@ class AppViewModel : ViewModel() {
                             isLoggedIn = false,
                             role = UserRole.STUDENT,
                             isSyncingWithSupabase = false,
-                            isSubjectsLoaded = true
+                            isSubjectsLoaded = true,
+                            enrolledSubjectIds = emptySet(),
+                            isEnrollmentsLoaded = false,
+                            enrollmentsError = null
                         )
                     }
                     return@launch
@@ -251,106 +287,179 @@ class AppViewModel : ViewModel() {
     fun syncWithSupabase() {
         val config = _uiState.value.supabaseConfig
 
-        viewModelScope.launch {
-            var session = SessionManager.getSession()
-            // منع إرسال طلب مجهول إلى الجداول التي تتطلب دور authenticated
-            if (session == null || session.accessToken.isBlank()) {
-                _uiState.update {
-                    it.copy(
-                        isSyncingWithSupabase = false,
-                        isSubjectsLoaded = true,
-                        subjectsError = if (it.isLoggedIn) "جلسة المستخدم غير متوفرة، يرجى إعادة تسجيل الدخول" else null
-                    )
-                }
-                return@launch
-            }
-
-            // إذا انتهت صلاحية التوكن، نقوم بتجديده أولاً لضمان وجود رمز وصول صالح
-            if (SessionManager.isTokenExpired()) {
-                val refreshResult = SupabaseAuthService.refreshToken(session.refreshToken, config)
-                if (refreshResult is AuthResult.Success) {
-                    SessionManager.saveSession(refreshResult.session)
-                    session = refreshResult.session
-                } else {
-                    SessionManager.clearSession()
-                    _uiState.update {
-                        it.copy(
-                            isLoggedIn = false,
-                            isSyncingWithSupabase = false,
-                            isSubjectsLoaded = true,
-                            subjectsError = "انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول"
-                        )
+        val syncJob: Job
+        val currentSyncId: Long
+        synchronized(syncExecutionLock) {
+            activeSyncJob?.cancel(CancellationException("بدء مزامنة أحدث مع Supabase"))
+            currentSyncId = syncSequenceCounter.incrementAndGet()
+            syncJob = viewModelScope.launch {
+                var session = SessionManager.getSession()
+                // منع إرسال طلب مجهول إلى الجداول التي تتطلب دور authenticated
+                if (session == null || session.accessToken.isBlank()) {
+                    synchronized(syncExecutionLock) {
+                        if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get()) {
+                            _uiState.update {
+                                it.copy(
+                                    isSyncingWithSupabase = false,
+                                    isSubjectsLoaded = true,
+                                    subjectsError = if (it.isLoggedIn) "جلسة المستخدم غير متوفرة، يرجى إعادة تسجيل الدخول" else null
+                                )
+                            }
+                        }
                     }
                     return@launch
                 }
-            }
 
-            val accessToken = session.accessToken
-            _uiState.update { it.copy(isSyncingWithSupabase = true, subjectsError = null) }
-
-            // 1. جلب السنوات الدراسية من جدول public.academic_years
-            val yearsRes = SupabaseDatabaseService.fetchAcademicYears(accessToken, config)
-            if (yearsRes.isSuccess) {
-                _uiState.update { it.copy(academicYears = yearsRes.getOrDefault(emptyList())) }
-            }
-
-            // 2. جلب الفصول الدراسية من جدول public.semesters
-            val semestersRes = SupabaseDatabaseService.fetchSemesters(accessToken, config)
-            if (semestersRes.isSuccess) {
-                _uiState.update { it.copy(semesters = semestersRes.getOrDefault(emptyList())) }
-            }
-
-            // 3. جلب المواد الدراسية من جدول public.subjects
-            // وفق سياسات RLS: المشرف يصله جميع المواد، بينما الطالب تصله المنشورة فقط
-            val subjectsRes = SupabaseDatabaseService.fetchSubjects(accessToken, config)
-            if (subjectsRes.isSuccess) {
-                val remoteSubjects = subjectsRes.getOrDefault(emptyList())
-                _uiState.update { state ->
-                    val publishedIds = remoteSubjects.filter { it.isPublished }.map { it.id }.toSet()
-                    state.copy(
-                        subjects = remoteSubjects,
-                        addedSubjectIds = publishedIds,
-                        isSubjectsLoaded = true,
-                        subjectsError = null
-                    )
-                }
-            } else {
-                val errorMsg = subjectsRes.exceptionOrNull()?.message ?: "فشل تحميل المواد من الخادم"
-                _uiState.update { state ->
-                    state.copy(
-                        isSubjectsLoaded = true,
-                        subjectsError = errorMsg
-                    )
-                }
-            }
-
-            // 4. مزامنة الدروس والمحاضرات من Supabase
-            val topicsRes = SupabaseDatabaseService.fetchAllTopics(config)
-            if (topicsRes.isSuccess) {
-                val remoteTopics = topicsRes.getOrNull().orEmpty()
-                _uiState.update { state ->
-                    val updatedMap = state.customTopicsBySubject.toMutableMap()
-                    remoteTopics.forEach { (sId, list) ->
-                        val localList = updatedMap[sId].orEmpty()
-                        val combined = (localList + list).distinctBy { it.id }
-                        updatedMap[sId] = combined
+                // إذا انتهت صلاحية التوكن، نقوم بتجديده أولاً لضمان وجود رمز وصول صالح
+                if (SessionManager.isTokenExpired()) {
+                    val refreshResult = SupabaseAuthService.refreshToken(session.refreshToken, config)
+                    synchronized(syncExecutionLock) {
+                        if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get()) {
+                            if (refreshResult is AuthResult.Success) {
+                                SessionManager.saveSession(refreshResult.session)
+                                session = refreshResult.session
+                            } else {
+                                SessionManager.clearSession()
+                                _uiState.update {
+                                    it.copy(
+                                        isLoggedIn = false,
+                                        isSyncingWithSupabase = false,
+                                        isSubjectsLoaded = true,
+                                        subjectsError = "انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول"
+                                    )
+                                }
+                                return@launch
+                            }
+                        } else {
+                            return@launch
+                        }
                     }
-                    state.copy(customTopicsBySubject = updatedMap)
+                }
+
+                val activeSession = session ?: return@launch
+                val accessToken = activeSession.accessToken
+                val syncUserId = activeSession.userId.trim()
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get()) {
+                        _uiState.update { it.copy(isSyncingWithSupabase = true, subjectsError = null) }
+                    }
+                }
+
+                // 1. جلب السنوات الدراسية من جدول public.academic_years
+                val yearsRes = SupabaseDatabaseService.fetchAcademicYears(accessToken, config)
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get() && yearsRes.isSuccess) {
+                        _uiState.update { it.copy(academicYears = yearsRes.getOrDefault(emptyList())) }
+                    }
+                }
+
+                // 2. جلب الفصول الدراسية من جدول public.semesters
+                val semestersRes = SupabaseDatabaseService.fetchSemesters(accessToken, config)
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get() && semestersRes.isSuccess) {
+                        _uiState.update { it.copy(semesters = semestersRes.getOrDefault(emptyList())) }
+                    }
+                }
+
+                // 3. جلب المواد الدراسية من جدول public.subjects
+                // وفق سياسات RLS: المشرف يصله جميع المواد، بينما الطالب تصله المنشورة فقط
+                val subjectsRes = SupabaseDatabaseService.fetchSubjects(accessToken, config)
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get()) {
+                        if (subjectsRes.isSuccess) {
+                            val remoteSubjects = subjectsRes.getOrDefault(emptyList())
+                            _uiState.update { state ->
+                                val publishedIds = remoteSubjects.filter { it.isPublished }.map { it.id }.toSet()
+                                state.copy(
+                                    subjects = remoteSubjects,
+                                    addedSubjectIds = publishedIds,
+                                    isSubjectsLoaded = true,
+                                    subjectsError = null
+                                )
+                            }
+                        } else {
+                            val errorMsg = subjectsRes.exceptionOrNull()?.message ?: "فشل تحميل المواد من الخادم"
+                            _uiState.update { state ->
+                                state.copy(
+                                    isSubjectsLoaded = true,
+                                    subjectsError = errorMsg
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // 4. مزامنة الدروس والمحاضرات من Supabase
+                val topicsRes = SupabaseDatabaseService.fetchAllTopics(config)
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get() && topicsRes.isSuccess) {
+                        val remoteTopics = topicsRes.getOrNull().orEmpty()
+                        _uiState.update { state ->
+                            val updatedMap = state.customTopicsBySubject.toMutableMap()
+                            remoteTopics.forEach { (sId, list) ->
+                                val localList = updatedMap[sId].orEmpty()
+                                val combined = (localList + list).distinctBy { it.id }
+                                updatedMap[sId] = combined
+                            }
+                            state.copy(customTopicsBySubject = updatedMap)
+                        }
+                    }
+                }
+
+                // 5. جلب اشتراكات الطالب الفعلية من Supabase للمستخدم الحالي مع حماية شاملة وذرية ضد السباق وتبديل الحساب
+                val enrollmentsRes = SupabaseDatabaseService.fetchUserEnrollments(accessToken, config)
+                synchronized(syncExecutionLock) {
+                    val currentSession = SessionManager.getSession()
+                    val isValidSync = currentSyncId == syncSequenceCounter.get() &&
+                            currentSession?.userId?.trim() == syncUserId &&
+                            !isLoggingOut.get()
+
+                    if (isValidSync) {
+                        if (enrollmentsRes.isSuccess) {
+                            val enrollments = enrollmentsRes.getOrDefault(emptyList())
+                            val validSubjectIds = enrollments.map { it.subjectId }.toSet()
+                            SessionManager.saveCachedEnrolledSubjectIds(syncUserId, validSubjectIds)
+                            _uiState.update { state ->
+                                state.copy(
+                                    enrolledSubjectIds = validSubjectIds,
+                                    isEnrollmentsLoaded = true,
+                                    enrollmentsError = null
+                                )
+                            }
+                        } else {
+                            val err = enrollmentsRes.exceptionOrNull()?.message ?: "فشل مزامنة الاشتراكات من الخادم"
+                            val cachedIds = SessionManager.getCachedEnrolledSubjectIds(syncUserId)
+                            _uiState.update { state ->
+                                state.copy(
+                                    enrolledSubjectIds = if (cachedIds.isNotEmpty()) cachedIds else state.enrolledSubjectIds,
+                                    isEnrollmentsLoaded = if (cachedIds.isNotEmpty()) true else state.isEnrollmentsLoaded,
+                                    enrollmentsError = err
+                                )
+                            }
+                        }
+                    } else {
+                        Log.d("AppViewModel", "Sync results for user $syncUserId discarded: sequence mismatch or user logged out/switched")
+                    }
+                }
+
+                val syncMsg = if (subjectsRes.isSuccess && enrollmentsRes.isSuccess) {
+                    "تمت المزامنة بنجاح مع Supabase"
+                } else {
+                    _uiState.value.subjectsError ?: _uiState.value.enrollmentsError
+                }
+
+                synchronized(syncExecutionLock) {
+                    if (currentSyncId == syncSequenceCounter.get() && !isLoggingOut.get()) {
+                        _uiState.update {
+                            it.copy(
+                                isSyncingWithSupabase = false,
+                                supabaseSyncStatusMessage = syncMsg
+                            )
+                        }
+                    }
                 }
             }
-
-            val syncMsg = if (subjectsRes.isSuccess) {
-                "تمت المزامنة بنجاح مع Supabase"
-            } else {
-                _uiState.value.subjectsError
-            }
-
-            _uiState.update {
-                it.copy(
-                    isSyncingWithSupabase = false,
-                    supabaseSyncStatusMessage = syncMsg
-                )
-            }
+            activeSyncJob = syncJob
         }
     }
 
@@ -363,8 +472,22 @@ class AppViewModel : ViewModel() {
             return
         }
 
+        // إلغاء أي مزامنة نشطة وزيادة عداد التسلسل لمنع تداخل كاش أو بيانات المستخدم السابق (المرحلة 2-C-1-R)
+        synchronized(syncExecutionLock) {
+            activeSyncJob?.cancel(CancellationException("تسجيل دخول جديد، تم إلغاء المزامنة السابقة"))
+            syncSequenceCounter.incrementAndGet()
+        }
+
         viewModelScope.launch {
-            _uiState.update { it.copy(isLoggingIn = true, loginError = null) }
+            _uiState.update {
+                it.copy(
+                    isLoggingIn = true,
+                    loginError = null,
+                    enrolledSubjectIds = emptySet(),
+                    isEnrollmentsLoaded = false,
+                    enrollmentsError = null
+                )
+            }
             val result = SupabaseAuthService.signInWithEmail(
                 email = cleanEmail,
                 pass = cleanPass,
@@ -397,7 +520,10 @@ class AppViewModel : ViewModel() {
                                 loginError = null,
                                 isLoggingIn = false,
                                 currentTab = 0,
-                                selectedSubjectId = null
+                                selectedSubjectId = null,
+                                activePdfSession = null,
+                                isOpeningPdf = false,
+                                pdfViewerError = null
                             )
                         }
                         syncWithSupabase()
@@ -540,6 +666,12 @@ class AppViewModel : ViewModel() {
             activeDownloadJobs.clear()
         }
 
+        // إلغاء مهمة المزامنة النشطة وزيادة عداد التسلسل لمنع أي كتابة كاش أو تحديث حالة بعد الخروج (المرحلة 2-C-1-R)
+        synchronized(syncExecutionLock) {
+            activeSyncJob?.cancel(CancellationException("تم إلغاء المزامنة بسبب تسجيل الخروج"))
+            syncSequenceCounter.incrementAndGet()
+        }
+
         // 2. تشغيل عملية التنظيف على خيط IO مع حماية القسم الحرج بـ NonCancellable
         viewModelScope.launch(Dispatchers.IO) {
             try {
@@ -583,7 +715,13 @@ class AppViewModel : ViewModel() {
                         currentTab = 0,
                         selectedSubjectId = null,
                         loginError = null,
-                        localPdfStatuses = emptyMap()
+                        localPdfStatuses = emptyMap(),
+                        enrolledSubjectIds = emptySet(),
+                        isEnrollmentsLoaded = false,
+                        enrollmentsError = null,
+                        activePdfSession = null,
+                        isOpeningPdf = false,
+                        pdfViewerError = null
                     )
                 }
                 isLoggingOut.set(false)
@@ -628,15 +766,9 @@ class AppViewModel : ViewModel() {
     }
 
     fun toggleEnroll(subjectId: String) {
-        _uiState.update { state ->
-            val updated = state.enrolledSubjectIds.toMutableSet()
-            if (updated.contains(subjectId)) {
-                updated.remove(subjectId)
-            } else {
-                updated.add(subjectId)
-            }
-            state.copy(enrolledSubjectIds = updated)
-        }
+        // الاشتراكات الفعلية مستمدة حصرياً من جدول public.subject_enrollments في Supabase
+        // الدالة تحافظ على سلوك الواجهة بفتح المادة للتصفح دون تعديل صلاحيات الوصول محلياً
+        selectSubject(subjectId)
     }
 
     fun setSearchQuery(q: String) {
@@ -875,26 +1007,36 @@ class AppViewModel : ViewModel() {
         title: String,
         subjectId: String,
         lessonId: String,
+        orderIndex: Int = 0,
+        isPublished: Boolean = false,
         onResult: ((Result<LessonPdf>) -> Unit)? = null
     ) {
         val cleanTitle = title.trim()
         val cleanSubjectId = subjectId.trim()
         val cleanLessonId = lessonId.trim()
 
-        // 1. فحص الحجز الذري: رفض العملية فوراً إذا كانت هناك عملية PDF أخرى جارية دون تغيير حالة العملية القائمة
-        if (!isPdfOperationLock.compareAndSet(false, true)) {
-            onResult?.invoke(
-                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
-            )
-            return
-        }
-
-        // آلية لضمان استدعاء onResult مرة واحدة فقط حتى في حال حدوسط استثناءات لاحقة
+        // آلية لضمان استدعاء onResult مرة واحدة فقط حتى في حال حدوث استثناءات لاحقة
         val hasReportedResult = AtomicBoolean(false)
         fun notifyResult(res: Result<LessonPdf>) {
             if (hasReportedResult.compareAndSet(false, true)) {
                 onResult?.invoke(res)
             }
+        }
+
+        // 1. التحقق الصارم من صلاحية المشرف
+        if (_uiState.value.role != UserRole.ADMIN) {
+            val notAdminErr = Exception("لا تملك صلاحية المشرف لرفع وإضافة ملفات الـ PDF")
+            _uiState.update { it.copy(pdfOperationError = notAdminErr.message) }
+            notifyResult(Result.failure(notAdminErr))
+            return
+        }
+
+        // 2. فحص الحجز الذري: رفض العملية فوراً إذا كانت هناك عملية PDF أخرى جارية دون تغيير حالة العملية القائمة
+        if (!isPdfOperationLock.compareAndSet(false, true)) {
+            notifyResult(
+                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
+            )
+            return
         }
 
         if (cleanTitle.isBlank()) {
@@ -963,7 +1105,7 @@ class AppViewModel : ViewModel() {
                 val uploadData = uploadRes.getOrThrow()
                 _uiState.update { it.copy(pdfOperationMessage = "تم الرفع السحابي، جاري تسجيل بيانات الملف...") }
 
-                // 2. تسجيل بيانات الملف في جدول lesson_pdfs (isPublished = false افتراضيًا)
+                // 2. تسجيل بيانات الملف في جدول lesson_pdfs مع مراعاة الترتيب وحالة النشر
                 val insertRes = SupabaseDatabaseService.insertLessonPdf(
                     lessonId = cleanLessonId,
                     subjectId = cleanSubjectId,
@@ -971,8 +1113,8 @@ class AppViewModel : ViewModel() {
                     filePath = uploadData.filePath,
                     fileSizeBytes = uploadData.fileSizeBytes,
                     mimeType = uploadData.mimeType,
-                    orderIndex = 0,
-                    isPublished = false,
+                    orderIndex = orderIndex,
+                    isPublished = isPublished,
                     accessToken = token,
                     config = config
                 )
@@ -986,7 +1128,7 @@ class AppViewModel : ViewModel() {
                         state.copy(
                             lessonPdfsByLesson = updatedMap,
                             pdfOperationError = null,
-                            pdfOperationMessage = "تم إضافة ملف الـ PDF بنجاح وحفظه كمسودة"
+                            pdfOperationMessage = if (isPublished) "تم إضافة ونشر ملف الـ PDF بنجاح" else "تم إضافة ملف الـ PDF بنجاح وحفظه كمسودة"
                         )
                     }
                     notifyResult(Result.success(newPdf))
@@ -1045,18 +1187,26 @@ class AppViewModel : ViewModel() {
         pdf: LessonPdf,
         onResult: ((Result<Unit>) -> Unit)? = null
     ) {
-        if (!isPdfOperationLock.compareAndSet(false, true)) {
-            onResult?.invoke(
-                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
-            )
-            return
-        }
-
         val hasReportedResult = AtomicBoolean(false)
         fun notifyResult(res: Result<Unit>) {
             if (hasReportedResult.compareAndSet(false, true)) {
                 onResult?.invoke(res)
             }
+        }
+
+        // 1. التحقق الصارم من صلاحية المشرف
+        if (_uiState.value.role != UserRole.ADMIN) {
+            val notAdminErr = Exception("لا تملك صلاحية المشرف لحذف ملف الـ PDF")
+            _uiState.update { it.copy(pdfOperationError = notAdminErr.message) }
+            notifyResult(Result.failure(notAdminErr))
+            return
+        }
+
+        if (!isPdfOperationLock.compareAndSet(false, true)) {
+            notifyResult(
+                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
+            )
+            return
         }
 
         _uiState.update {
@@ -1175,20 +1325,29 @@ class AppViewModel : ViewModel() {
     ) {
         val cleanId = pdfId.trim()
         val cleanLessonId = lessonId.trim()
-        if (cleanId.isBlank() || cleanLessonId.isBlank()) return
-
-        if (!isPdfOperationLock.compareAndSet(false, true)) {
-            onResult?.invoke(
-                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
-            )
-            return
-        }
 
         val hasReportedResult = AtomicBoolean(false)
         fun notifyResult(res: Result<Unit>) {
             if (hasReportedResult.compareAndSet(false, true)) {
                 onResult?.invoke(res)
             }
+        }
+
+        // 1. التحقق الصارم من صلاحية المشرف
+        if (_uiState.value.role != UserRole.ADMIN) {
+            val notAdminErr = Exception("لا تملك صلاحية المشرف لحذف سجل ملف الـ PDF")
+            _uiState.update { it.copy(pdfOperationError = notAdminErr.message) }
+            notifyResult(Result.failure(notAdminErr))
+            return
+        }
+
+        if (cleanId.isBlank() || cleanLessonId.isBlank()) return
+
+        if (!isPdfOperationLock.compareAndSet(false, true)) {
+            notifyResult(
+                Result.failure(Exception("هناك عملية PDF أخرى جارية بالفعل، يرجى الانتظار حتى اكتمالها"))
+            )
+            return
         }
 
         // التحقق الإلزامي: هل المعرف مقيد ومسجل كملف نجح حذف كائنه التخزيني مسبقاً؟
@@ -1272,6 +1431,175 @@ class AppViewModel : ViewModel() {
                 notifyResult(Result.failure(e))
             } finally {
                 isPdfOperationLock.set(false)
+                _uiState.update { it.copy(isPdfOperating = false) }
+            }
+        }
+    }
+
+    /**
+     * تحديث البيانات الوصفية لملف PDF (العنوان، حالة النشر، الترتيب) بواسطة المشرف
+     * مع منع تكرار التحديث المتزامن لنفس الملف، وتحديث القائمة في الذاكرة عند النجاح
+     */
+    fun updateLessonPdfDetails(
+        pdfId: String,
+        title: String,
+        isPublished: Boolean,
+        orderIndex: Int,
+        lessonId: String = "",
+        onResult: ((Result<LessonPdf>) -> Unit)? = null
+    ) {
+        val hasReportedResult = AtomicBoolean(false)
+        fun notifyResult(res: Result<LessonPdf>) {
+            if (hasReportedResult.compareAndSet(false, true)) {
+                onResult?.invoke(res)
+            }
+        }
+
+        // 1. التحقق من صلاحية المشرف
+        if (_uiState.value.role != UserRole.ADMIN) {
+            val notAdminErr = Exception("لا تملك صلاحية المشرف لتعديل بيانات ملف الـ PDF")
+            _uiState.update { it.copy(pdfOperationError = notAdminErr.message) }
+            notifyResult(Result.failure(notAdminErr))
+            return
+        }
+
+        val cleanPdfId = pdfId.trim()
+        val cleanTitle = title.trim()
+        val cleanLessonId = lessonId.trim()
+
+        // 2. التحقق من صحة المدخلات
+        if (cleanPdfId.isBlank()) {
+            val err = Exception("معرف ملف الـ PDF مطلوب ولا يمكن أن يكون فارغاً")
+            _uiState.update { it.copy(pdfOperationError = err.message) }
+            notifyResult(Result.failure(err))
+            return
+        }
+        try {
+            UUID.fromString(cleanPdfId)
+        } catch (_: IllegalArgumentException) {
+            val err = Exception("معرف ملف الـ PDF غير صالح (يجب أن يكون UUID)")
+            _uiState.update { it.copy(pdfOperationError = err.message) }
+            notifyResult(Result.failure(err))
+            return
+        }
+
+        if (cleanTitle.isBlank()) {
+            val err = Exception("عنوان ملف الـ PDF مطلوب ولا يمكن أن يكون فارغاً")
+            _uiState.update { it.copy(pdfOperationError = err.message) }
+            notifyResult(Result.failure(err))
+            return
+        }
+
+        // 3. منع تكرار عمليات التحديث المتزامنة لنفس الملف
+        if (!updatingPdfIds.add(cleanPdfId)) {
+            val err = Exception("هناك عملية تحديث جارية بالفعل لهذا الملف، يرجى الانتظار")
+            _uiState.update { it.copy(pdfOperationError = err.message) }
+            notifyResult(Result.failure(err))
+            return
+        }
+
+        _uiState.update {
+            it.copy(
+                isPdfOperating = true,
+                pdfOperationError = null,
+                pdfOperationMessage = "جاري تحديث بيانات ملف الـ PDF..."
+            )
+        }
+
+        viewModelScope.launch {
+            try {
+                val tokenRes = getValidAccessToken()
+                if (tokenRes.isFailure) {
+                    val err = tokenRes.exceptionOrNull() ?: Exception("تعذر التحقق من جلسة المشرف")
+                    _uiState.update {
+                        it.copy(
+                            pdfOperationError = err.message,
+                            pdfOperationMessage = null
+                        )
+                    }
+                    notifyResult(Result.failure(err))
+                    return@launch
+                }
+
+                val token = tokenRes.getOrThrow()
+                val config = _uiState.value.supabaseConfig
+
+                val updateRes = SupabaseDatabaseService.updateLessonPdf(
+                    pdfId = cleanPdfId,
+                    title = cleanTitle,
+                    isPublished = isPublished,
+                    orderIndex = orderIndex,
+                    accessToken = token,
+                    config = config
+                )
+
+                if (updateRes.isSuccess) {
+                    val updatedPdf = updateRes.getOrThrow()
+                    _uiState.update { state ->
+                        // الأولوية الأساسية لمعرف الدرس المعتمد القادم من الخادم، وcleanLessonId قيمة احتياطية فقط
+                        val targetLessonId = updatedPdf.lessonId.trim().ifBlank { cleanLessonId }
+                        val updatedMap = state.lessonPdfsByLesson.toMutableMap()
+
+                        if (targetLessonId.isNotBlank()) {
+                            // تنظيف أي ظهور سابق للملف في دروس أخرى إذا مررت الواجهة معرف درس غير مطابق
+                            for ((lId, list) in updatedMap.toMap()) {
+                                if (lId != targetLessonId && list.any { it.id == cleanPdfId }) {
+                                    updatedMap[lId] = list.filter { it.id != cleanPdfId }
+                                }
+                            }
+
+                            // تحديث أو إدراج الملف داخل قائمة الدرس الصحيح المعتمد من الخادم
+                            val currentTargetList = updatedMap[targetLessonId].orEmpty()
+                            if (currentTargetList.any { it.id == cleanPdfId }) {
+                                updatedMap[targetLessonId] = currentTargetList.map { existing ->
+                                    if (existing.id == cleanPdfId) updatedPdf else existing
+                                }
+                            } else if (currentTargetList.isNotEmpty()) {
+                                updatedMap[targetLessonId] = currentTargetList + updatedPdf
+                            } else {
+                                updatedMap[targetLessonId] = listOf(updatedPdf)
+                            }
+                        } else {
+                            // إجراء احتياطي في حال غياب كلا المعرفين: البحث في القوائم القائمة والاستبدال في مكانها
+                            for ((lId, list) in updatedMap) {
+                                if (list.any { it.id == cleanPdfId }) {
+                                    updatedMap[lId] = list.map { existing ->
+                                        if (existing.id == cleanPdfId) updatedPdf else existing
+                                    }
+                                    break
+                                }
+                            }
+                        }
+
+                        state.copy(
+                            lessonPdfsByLesson = updatedMap,
+                            pdfOperationError = null,
+                            pdfOperationMessage = "تم تحديث بيانات ملف الـ PDF بنجاح"
+                        )
+                    }
+                    notifyResult(Result.success(updatedPdf))
+                } else {
+                    val err = updateRes.exceptionOrNull() ?: Exception("فشل تحديث بيانات الملف في قاعدة البيانات")
+                    _uiState.update {
+                        it.copy(
+                            pdfOperationError = err.message,
+                            pdfOperationMessage = null
+                        )
+                    }
+                    notifyResult(Result.failure(err))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        pdfOperationError = e.message ?: "حدث خطأ غير متوقع أثناء تحديث بيانات الملف",
+                        pdfOperationMessage = null
+                    )
+                }
+                notifyResult(Result.failure(e))
+            } finally {
+                updatingPdfIds.remove(cleanPdfId)
                 _uiState.update { it.copy(isPdfOperating = false) }
             }
         }
@@ -2483,6 +2811,45 @@ class AppViewModel : ViewModel() {
     internal fun isLoggingOut(): Boolean = isLoggingOut.get()
     internal fun getActiveJobsCount(): Int = activeDownloadJobs.size
 
+    internal fun setTestRole(role: UserRole) {
+        _uiState.update { it.copy(role = role) }
+    }
+
+    internal fun setTestSubjects(
+        subjects: List<Subject>,
+        enrolledSubjectIds: Set<String> = emptySet(),
+        isEnrollmentsLoaded: Boolean = true
+    ) {
+        _uiState.update {
+            it.copy(
+                subjects = subjects,
+                isSubjectsLoaded = true,
+                enrolledSubjectIds = enrolledSubjectIds,
+                isEnrollmentsLoaded = isEnrollmentsLoaded
+            )
+        }
+    }
+
+    internal fun setTestEnrollments(
+        enrolledSubjectIds: Set<String>,
+        isLoaded: Boolean = true,
+        error: String? = null
+    ) {
+        _uiState.update {
+            it.copy(
+                enrolledSubjectIds = enrolledSubjectIds,
+                isEnrollmentsLoaded = isLoaded,
+                enrollmentsError = error
+            )
+        }
+    }
+
+    internal fun setTestLessonPdfs(lessonId: String, pdfs: List<LessonPdf>) {
+        val updated = _uiState.value.lessonPdfsByLesson.toMutableMap()
+        updated[lessonId] = pdfs
+        _uiState.update { it.copy(lessonPdfsByLesson = updated) }
+    }
+
     internal fun buildDownloadJobKey(userId: String, pdfId: String): String {
         return "${userId.trim()}_${pdfId.trim()}"
     }
@@ -2557,6 +2924,82 @@ class AppViewModel : ViewModel() {
                 state.copy(localPdfStatuses = updated)
             }
             return
+        }
+
+        // 3. بوابة التحقق الاستباقي من صلاحية الوصول للطالب
+        val currentState = _uiState.value
+        val isAdmin = currentState.role == UserRole.ADMIN
+
+        if (!isAdmin) {
+            // أ. التحقق من أن ملف الـ PDF منشور
+            if (!pdf.isPublished) {
+                _uiState.update { state ->
+                    val updated = state.localPdfStatuses.toMutableMap()
+                    updated[cleanPdfId] = LocalPdfStatus.Error("الملف غير متاح حالياً للتنزيل (غير منشور)")
+                    state.copy(localPdfStatuses = updated)
+                }
+                return
+            }
+
+            // ب. التحقق من أن قائمة المواد محملة في الذاكرة للتحقق الموثوق
+            if (!currentState.isSubjectsLoaded) {
+                _uiState.update { state ->
+                    val updated = state.localPdfStatuses.toMutableMap()
+                    updated[cleanPdfId] = LocalPdfStatus.Error("لم يتم تحميل قائمة المواد بعد، يرجى الانتظار والمحاولة مجدداً")
+                    state.copy(localPdfStatuses = updated)
+                }
+                return
+            }
+
+            // ج. التحقق من وجود المادة
+            val subject = currentState.subjects.firstOrNull { it.id == pdf.subjectId }
+            if (subject == null) {
+                _uiState.update { state ->
+                    val updated = state.localPdfStatuses.toMutableMap()
+                    updated[cleanPdfId] = LocalPdfStatus.Error("تعذر العثور على المادة التابع لها هذا الملف")
+                    state.copy(localPdfStatuses = updated)
+                }
+                return
+            }
+
+            // د. التحقق من أن المادة منشورة
+            if (!subject.isPublished) {
+                _uiState.update { state ->
+                    val updated = state.localPdfStatuses.toMutableMap()
+                    updated[cleanPdfId] = LocalPdfStatus.Error("المادة غير منشورة حالياً ولا يمكن تنزيل ملفاتها")
+                    state.copy(localPdfStatuses = updated)
+                }
+                return
+            }
+
+            // هـ. التحقق من استحقاق الوصول: المادة مجانية (pricePoints == 0) أو الطالب مشترك بها
+            val isFreeSubject = subject.pricePoints <= 0
+            if (!isFreeSubject) {
+                if (!currentState.isEnrollmentsLoaded) {
+                    val syncErr = currentState.enrollmentsError
+                    val errMsg = if (!syncErr.isNullOrBlank()) {
+                        "تعذر التحقق من اشتراكك في المادة بسبب خطأ في مزامنة الاشتراكات ($syncErr)، يرجى إعادة المحاولة"
+                    } else {
+                        "جاري مزامنة بيانات اشتراكاتك من الخادم، يرجى الانتظار والمحاولة مجدداً"
+                    }
+                    _uiState.update { state ->
+                        val updated = state.localPdfStatuses.toMutableMap()
+                        updated[cleanPdfId] = LocalPdfStatus.Error(errMsg)
+                        state.copy(localPdfStatuses = updated)
+                    }
+                    return
+                }
+
+                val isEnrolled = currentState.enrolledSubjectIds.contains(subject.id)
+                if (!isEnrolled) {
+                    _uiState.update { state ->
+                        val updated = state.localPdfStatuses.toMutableMap()
+                        updated[cleanPdfId] = LocalPdfStatus.Error("يجب الاشتراك في المادة أولاً لتتمكن من تنزيل ملفاتها")
+                        state.copy(localPdfStatuses = updated)
+                    }
+                    return
+                }
+            }
         }
 
         val targetFile = try {
@@ -2849,5 +3292,234 @@ class AppViewModel : ViewModel() {
                 state.copy(localPdfStatuses = state.localPdfStatuses + newStatuses)
             }
         }
+    }
+
+    // =========================================================================
+    // المرحلة 2-C-1: فتح وإغلاق ملفات PDF المشفرة محلياً للعرض الآمن داخل التطبيق
+    // =========================================================================
+
+    /**
+     * مسح رسائل الخطأ الخاصة بعارض ملفات الـ PDF
+     */
+    fun clearPdfViewerError() {
+        _uiState.update { it.copy(pdfViewerError = null) }
+    }
+
+    /**
+     * تنظيف ملفات العرض المؤقتة المتبقية من جلسات سابقة (المرحلة 2-C-1)
+     * يمسح مجلد midad_viewer_temp بالكامل دون المساس بالملفات الأصلية المشفرة (.enc)
+     */
+    fun cleanupResidualViewerTempFiles(context: Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                PdfSecurityStorageService.purgeViewerCacheDirectory(context.cacheDir)
+            } catch (e: Exception) {
+                android.util.Log.e("AppViewModel", "Failed to purge residual viewer cache", e)
+            }
+        }
+    }
+
+    /**
+     * فتح ملف PDF المشفر للعرض الآمن داخل التطبيق:
+     * 1. التحقق من عدم وجود جلسة عرض نشطة أخرى أو عملية فتح جارية (لمنع فتح أكثر من ملف).
+     * 2. التحقق من صلاحية معرف الـ PDF.
+     * 3. التحقق من جلسة المستخدم واستخراج معرفه.
+     * 4. التحقق من استحقاق الوصول للطالب وفق آخر حالة اشتراك ناجحة محفوظة محلياً (أو المشرف أو المادة المجانية) دون اشتراط اتصال بالإنترنت.
+     * 5. التحقق من وجود الملف المشفر محلياً وعزله ضمن مجلد المستخدم الحالي.
+     * 6. فك تشفير تدفقي إلى ملف مؤقت داخل كاش التطبيق الخاص عبر decryptToTempFile دون كتابة ملف مكشوف دائم.
+     * 7. تحديث activePdfSession لعرض الملف.
+     */
+    fun openLessonPdf(context: Context, pdf: LessonPdf) {
+        // 1. منع فتح ملف آخر قبل تنظيف جلسة العرض السابقة، ومنع التداخل أثناء عملية الفتح
+        if (_uiState.value.isOpeningPdf || !isOpeningPdfLock.compareAndSet(false, true)) {
+            _uiState.update { it.copy(pdfViewerError = "هناك عملية فتح جارية بالفعل، يرجى الانتظار") }
+            return
+        }
+
+        if (_uiState.value.activePdfSession != null) {
+            isOpeningPdfLock.set(false)
+            _uiState.update {
+                it.copy(pdfViewerError = "هناك ملف معروض حالياً، يرجى إغلاق الملف الحالي أولاً قبل فتح ملف آخر")
+            }
+            return
+        }
+
+        val cleanPdfId = pdf.id.trim()
+
+        // 2. التحقق من صلاحية المعرف كـ UUID
+        try {
+            UUID.fromString(cleanPdfId)
+        } catch (_: IllegalArgumentException) {
+            isOpeningPdfLock.set(false)
+            _uiState.update { it.copy(pdfViewerError = "معرف ملف الـ PDF غير صالح (يجب أن يكون UUID)") }
+            return
+        }
+
+        // 3. التحقق من جلسة المستخدم واستخراج userId
+        val currentSession = SessionManager.getSession()
+        val sessionUserId = currentSession?.userId?.trim().orEmpty()
+        if (sessionUserId.isBlank()) {
+            isOpeningPdfLock.set(false)
+            _uiState.update { it.copy(pdfViewerError = "يجب تسجيل الدخول أولاً لفتح الملف") }
+            return
+        }
+
+        // 4. بوابة التحقق من صلاحية الوصول (المشرف أو الطالب وفق آخر حالة اشتراك ناجحة محفوظة)
+        val currentState = _uiState.value
+        val isAdmin = currentState.role == UserRole.ADMIN
+
+        if (!isAdmin) {
+            // أ. التحقق من أن الملف منشور
+            if (!pdf.isPublished) {
+                isOpeningPdfLock.set(false)
+                _uiState.update { it.copy(pdfViewerError = "الملف غير متاح حالياً للعرض (غير منشور)") }
+                return
+            }
+
+            // ب. التحقق من أن المادة منشورة إن توفرت بياناتها
+            val subject = currentState.subjects.firstOrNull { it.id == pdf.subjectId }
+            if (subject != null && !subject.isPublished) {
+                isOpeningPdfLock.set(false)
+                _uiState.update { it.copy(pdfViewerError = "المادة غير منشورة حالياً ولا يمكن عرض ملفاتها") }
+                return
+            }
+
+            // ج. فحص الاستحقاق: مجانية (pricePoints <= 0) أو اشتراك الطالب (يدعم العمل دون إنترنت)
+            val isFreeSubject = subject != null && subject.pricePoints <= 0
+            if (!isFreeSubject) {
+                val effectiveEnrolledIds = if (currentState.enrolledSubjectIds.isNotEmpty()) {
+                    currentState.enrolledSubjectIds
+                } else {
+                    SessionManager.getCachedEnrolledSubjectIds(sessionUserId)
+                }
+
+                if (!effectiveEnrolledIds.contains(pdf.subjectId)) {
+                    isOpeningPdfLock.set(false)
+                    _uiState.update { it.copy(pdfViewerError = "يجب الاشتراك في المادة أولاً لتتمكن من عرض ملفاتها") }
+                    return
+                }
+            }
+        }
+
+        // 5. التحقق من وجود الملف المشفر محلياً وعزله حسب المستخدم الحالي
+        val targetEncryptedFile = try {
+            getLocalEncryptedPdfFile(context, sessionUserId, cleanPdfId)
+        } catch (e: Exception) {
+            isOpeningPdfLock.set(false)
+            _uiState.update { it.copy(pdfViewerError = e.message ?: "مسار التخزين المشفر غير صالح") }
+            return
+        }
+
+        if (!PdfSecurityStorageService.isEncryptedFilePresent(targetEncryptedFile)) {
+            isOpeningPdfLock.set(false)
+            _uiState.update {
+                it.copy(pdfViewerError = "الملف المشفر غير موجود محلياً على جهازك، يرجى تنزيله أولاً")
+            }
+            return
+        }
+
+        // 6. بدء فك التشفير التدفقي إلى الملف المؤقت على مسار IO
+        _uiState.update { it.copy(isOpeningPdf = true, pdfViewerError = null) }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // تنظيف أي ملفات مؤقتة سابقة في مجلد العرض لضمان حالة نظيفة تماماً
+                PdfSecurityStorageService.purgeViewerCacheDirectory(context.cacheDir)
+
+                // التحقق من أن الجلسة لم تتغير ولم تبدأ عملية تسجيل الخروج
+                val preSession = SessionManager.getSession()
+                if (preSession?.userId?.trim() != sessionUserId || isLoggingOut.get()) {
+                    _uiState.update { it.copy(isOpeningPdf = false) }
+                    return@launch
+                }
+
+                // فك التشفير إلى ملف مؤقت في كاش التطبيق الخاص
+                val decryptResult = PdfSecurityStorageService.decryptToTempFile(
+                    encryptedFile = targetEncryptedFile,
+                    cacheDir = context.cacheDir
+                )
+
+                // التحقق بعد اكتمال فك التشفير من أن الجلسة ما زالت لنفس المستخدم
+                val postSession = SessionManager.getSession()
+                if (postSession?.userId?.trim() != sessionUserId || isLoggingOut.get()) {
+                    decryptResult.getOrNull()?.let { tempFile ->
+                        PdfSecurityStorageService.deleteSecureFile(tempFile, context.cacheDir)
+                    }
+                    PdfSecurityStorageService.purgeViewerCacheDirectory(context.cacheDir)
+                    _uiState.update { it.copy(isOpeningPdf = false) }
+                    return@launch
+                }
+
+                if (decryptResult.isSuccess) {
+                    val tempFile = decryptResult.getOrThrow()
+                    val session = ActivePdfSession(
+                        pdf = pdf,
+                        decryptedTempFile = tempFile
+                    )
+                    _uiState.update {
+                        it.copy(
+                            activePdfSession = session,
+                            isOpeningPdf = false,
+                            pdfViewerError = null
+                        )
+                    }
+                } else {
+                    val err = decryptResult.exceptionOrNull()
+                    val errorMsg = when (err) {
+                        is SecurityException -> err.message ?: "فشل التحقق الأمني من سلامة الملف المشفر"
+                        else -> err?.message ?: "تعذر فك تشفير الملف للعرض"
+                    }
+                    _uiState.update {
+                        it.copy(
+                            isOpeningPdf = false,
+                            pdfViewerError = errorMsg
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.update {
+                    it.copy(
+                        isOpeningPdf = false,
+                        pdfViewerError = e.message ?: "حدث خطأ غير متوقع أثناء فتح الملف"
+                    )
+                }
+            } finally {
+                isOpeningPdfLock.set(false)
+            }
+        }
+    }
+
+    /**
+     * إغلاق ملف الـ PDF المفتوح حالياً وحذف نسخته المؤقتة فقط:
+     * - يحذف الملف المؤقت من الكاش (midad_viewer_temp).
+     * - لا يحذف الملف الأصلي المشفر (.enc) المحفوظ في مساحة التطبيق الخاصة.
+     * - يفرغ بيانات جلسة العرض في AppUiState.
+     */
+    fun closeLessonPdf(context: Context) {
+        val currentSession = _uiState.value.activePdfSession
+        if (currentSession != null) {
+            try {
+                val tempFile = currentSession.decryptedTempFile
+                if (tempFile.exists()) {
+                    PdfSecurityStorageService.deleteSecureFile(tempFile, context.cacheDir)
+                }
+            } catch (_: Exception) {}
+        }
+
+        try {
+            PdfSecurityStorageService.purgeViewerCacheDirectory(context.cacheDir)
+        } catch (_: Exception) {}
+
+        _uiState.update {
+            it.copy(
+                activePdfSession = null,
+                isOpeningPdf = false,
+                pdfViewerError = null
+            )
+        }
+    }
+
+    internal fun setTestActivePdfSession(session: ActivePdfSession?) {
+        _uiState.update { it.copy(activePdfSession = session) }
     }
 }

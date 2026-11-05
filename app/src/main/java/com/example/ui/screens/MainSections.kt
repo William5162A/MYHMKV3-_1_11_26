@@ -49,8 +49,12 @@ import com.example.ui.theme.CairoFontFamily
 import com.example.ui.theme.DeepNavy
 import com.example.ui.theme.EmeraldMint
 import com.example.ui.theme.ReemKufiFontFamily
+import com.example.ui.components.AddEditLessonPdfDialog
+import com.example.ui.components.AdminLessonPdfCard
+import com.example.ui.components.StudentLessonPdfCard
 import com.example.viewmodel.AppUiState
 import com.example.viewmodel.AppViewModel
+import com.example.viewmodel.LocalPdfStatus
 import com.example.viewmodel.UserRole
 
 // ==============================================================================
@@ -1981,7 +1985,8 @@ fun CourseExplanationSection(
                             orderIndex = ls.orderIndex,
                             isPublished = !ls.isPublished
                         )
-                    }
+                    },
+                    viewModel = viewModel
                 )
             }
         }
@@ -2030,7 +2035,8 @@ private fun UnitItemCard(
     onTogglePublishChapter: (CourseChapter) -> Unit,
     onEditLesson: (CourseLesson) -> Unit,
     onDeleteLesson: (CourseLesson) -> Unit,
-    onTogglePublishLesson: (CourseLesson) -> Unit
+    onTogglePublishLesson: (CourseLesson) -> Unit,
+    viewModel: AppViewModel? = null
 ) {
     Card(
         modifier = Modifier
@@ -2293,7 +2299,8 @@ private fun UnitItemCard(
                                     onTogglePublishChapter = { onTogglePublishChapter(chapter) },
                                     onEditLesson = onEditLesson,
                                     onDeleteLesson = onDeleteLesson,
-                                    onTogglePublishLesson = onTogglePublishLesson
+                                    onTogglePublishLesson = onTogglePublishLesson,
+                                    viewModel = viewModel
                                 )
                             }
                         }
@@ -2317,7 +2324,8 @@ private fun UnitItemCard(
                                     onToggleCompletion = { onToggleLessonCompletion(lesson.id) },
                                     onEdit = { onEditLesson(lesson) },
                                     onDelete = { onDeleteLesson(lesson) },
-                                    onTogglePublish = { onTogglePublishLesson(lesson) }
+                                    onTogglePublish = { onTogglePublishLesson(lesson) },
+                                    viewModel = viewModel
                                 )
                             }
                         }
@@ -2349,7 +2357,8 @@ private fun ChapterItemCard(
     onTogglePublishChapter: () -> Unit,
     onEditLesson: (CourseLesson) -> Unit,
     onDeleteLesson: (CourseLesson) -> Unit,
-    onTogglePublishLesson: (CourseLesson) -> Unit
+    onTogglePublishLesson: (CourseLesson) -> Unit,
+    viewModel: AppViewModel? = null
 ) {
     Card(
         modifier = Modifier
@@ -2524,7 +2533,8 @@ private fun ChapterItemCard(
                                 onToggleCompletion = { onToggleLessonCompletion(lesson.id) },
                                 onEdit = { onEditLesson(lesson) },
                                 onDelete = { onDeleteLesson(lesson) },
-                                onTogglePublish = { onTogglePublishLesson(lesson) }
+                                onTogglePublish = { onTogglePublishLesson(lesson) },
+                                viewModel = viewModel
                             )
                         }
                     }
@@ -2545,8 +2555,53 @@ private fun LessonItemCard(
     onToggleCompletion: () -> Unit,
     onEdit: () -> Unit,
     onDelete: () -> Unit,
-    onTogglePublish: () -> Unit
+    onTogglePublish: () -> Unit,
+    viewModel: AppViewModel? = null
 ) {
+    val context = LocalContext.current
+    var isPdfSectionExpanded by remember { mutableStateOf(false) }
+
+    val liveState = viewModel?.uiState?.collectAsState()?.value
+    val allLessonPdfs = liveState?.lessonPdfsByLesson?.get(lesson.id).orEmpty()
+    val lessonPdfs = remember(allLessonPdfs, isAdmin) {
+        if (isAdmin) allLessonPdfs.sortedBy { it.orderIndex }
+        else allLessonPdfs.filter { it.isPublished }.sortedBy { it.orderIndex }
+    }
+    val isLoadingPdfs = liveState?.loadingPdfLessonIds?.contains(lesson.id) == true
+    val isPdfOperating = liveState?.isPdfOperating == true
+    val orphanPdfIds = liveState?.orphanPdfRecordIdsPendingDbDelete ?: emptySet()
+    val pdfError = liveState?.pdfOperationError
+
+    // تحميل ملفات الدرس عند توسيع القسم فقط مع الاستفادة من التخزين المؤقت المدمج
+    LaunchedEffect(lesson.id, isPdfSectionExpanded) {
+        if (isPdfSectionExpanded) {
+            viewModel?.loadPdfsForLesson(lesson.id)
+        }
+    }
+
+    // مزامنة حالة الملفات المشفرة المحفوظة محلياً عند توفر ملفات الدرس وربطها بمعرفات مستقرة لمنع التكرار
+    val pdfIdsKey = remember(lessonPdfs) { lessonPdfs.map { it.id }.sorted().joinToString(",") }
+    LaunchedEffect(lesson.id, pdfIdsKey) {
+        if (lessonPdfs.isNotEmpty()) {
+            viewModel?.checkAndSyncLocalPdfStatuses(context, lessonPdfs)
+        }
+    }
+
+    var pickedFileUri by remember { mutableStateOf<Uri?>(null) }
+    var pickedFileName by remember { mutableStateOf<String?>(null) }
+    var showAddPdfDialog by remember { mutableStateOf(false) }
+    var pdfToEdit by remember { mutableStateOf<LessonPdf?>(null) }
+
+    val filePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            pickedFileUri = uri
+            pickedFileName = SupabaseStorageService.getFileName(context, uri)
+            showAddPdfDialog = true
+        }
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -2694,29 +2749,35 @@ private fun LessonItemCard(
                 }
             }
 
-            // PDF Files Placeholder (Phase 2-B3-B1 Specification)
+            // PDF Files Section (Phase 2-A: Admin PDF Management)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(top = 8.dp),
+                    .padding(top = 8.dp)
+                    .testTag("lesson_pdf_section_${lesson.id}"),
                 shape = RoundedCornerShape(10.dp),
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f)
                 ),
                 border = androidx.compose.foundation.BorderStroke(
                     1.dp,
-                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                    if (isPdfSectionExpanded) EmeraldMint.copy(alpha = 0.5f)
+                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
                 )
             ) {
                 Column(modifier = Modifier.padding(10.dp)) {
+                    // Header Row: Icon, Title, Count, Expand Toggle, Add Button
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { isPdfSectionExpanded = !isPdfSectionExpanded },
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.weight(1f)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.PictureAsPdf,
@@ -2729,44 +2790,233 @@ private fun LessonItemCard(
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
                                 color = MaterialTheme.colorScheme.onSurface
                             )
-                        }
 
-                        if (isAdmin) {
                             Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = DeepNavy.copy(alpha = 0.1f)
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (lessonPdfs.isNotEmpty()) EmeraldMint.copy(alpha = 0.2f)
+                                else MaterialTheme.colorScheme.surfaceVariant
                             ) {
                                 Text(
-                                    text = "المرحلة القادمة 2-B3-B2",
+                                    text = "${lessonPdfs.size}",
                                     style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 9.sp,
+                                        fontSize = 10.sp,
                                         fontWeight = FontWeight.Bold
                                     ),
-                                    color = DeepNavy,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    color = if (lessonPdfs.isNotEmpty()) DeepNavy
+                                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                                )
+                            }
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            if (isAdmin) {
+                                Button(
+                                    onClick = {
+                                        filePicker.launch("application/pdf")
+                                    },
+                                    enabled = !isPdfOperating,
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = DeepNavy,
+                                        contentColor = Color.White
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    modifier = Modifier
+                                        .height(28.dp)
+                                        .testTag("btn_add_pdf_${lesson.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Add,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text("إضافة PDF", fontSize = 10.5.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+
+                            IconButton(
+                                onClick = { isPdfSectionExpanded = !isPdfSectionExpanded },
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .testTag("btn_toggle_expand_pdf_${lesson.id}")
+                            ) {
+                                Icon(
+                                    imageVector = if (isPdfSectionExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                    contentDescription = if (isPdfSectionExpanded) "طي المرفقات" else "توسيع المرفقات",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.size(18.dp)
                                 )
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    // Content when expanded
+                    AnimatedVisibility(visible = isPdfSectionExpanded) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            HorizontalDivider(
+                                color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
 
-                    Text(
-                        text = "لا توجد ملفات مرفقة حالياً بهذا الدرس.",
-                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    if (isAdmin) {
-                        Text(
-                            text = "سيتم تفعيل رفع وإدارة ملفات الـ PDF وربطها بهذا الدرس في المرحلة 2-B3-B2.",
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                            color = MaterialTheme.colorScheme.outline
-                        )
+                            if (isLoadingPdfs && lessonPdfs.isEmpty()) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 12.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        color = EmeraldMint,
+                                        strokeWidth = 2.dp
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = "جاري جلب ملفات الدرس...",
+                                        style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.5.sp),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            } else if (lessonPdfs.isEmpty()) {
+                                Text(
+                                    text = if (isAdmin) "لا توجد ملفات مرفقة حالياً بهذا الدرس. اضغط على «إضافة PDF» لرفع أول ملف."
+                                    else "لا توجد ملفات مرفقة منشورة لهذا الدرس حالياً.",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(vertical = 6.dp)
+                                )
+                            } else {
+                                if (isAdmin) {
+                                    lessonPdfs.forEach { pdf ->
+                                        AdminLessonPdfCard(
+                                            pdf = pdf,
+                                            isOrphanPendingDbDelete = orphanPdfIds.contains(pdf.id),
+                                            isOperating = isPdfOperating,
+                                            onTogglePublish = { targetPdf ->
+                                                viewModel?.updateLessonPdfDetails(
+                                                    pdfId = targetPdf.id,
+                                                    title = targetPdf.title,
+                                                    isPublished = !targetPdf.isPublished,
+                                                    orderIndex = targetPdf.orderIndex,
+                                                    lessonId = lesson.id
+                                                )
+                                            },
+                                            onEdit = { targetPdf ->
+                                                pdfToEdit = targetPdf
+                                            },
+                                            onDeleteWithStorage = { targetPdf ->
+                                                viewModel?.deleteLessonPdfWithStorage(targetPdf)
+                                            },
+                                            onDeleteRecordOnly = { targetPdf ->
+                                                viewModel?.deleteLessonPdfRecordOnly(targetPdf.id, lesson.id)
+                                            }
+                                        )
+                                    }
+                                } else {
+                                    // بطاقة ملف الـ PDF المخصصة للطالب
+                                    lessonPdfs.forEach { pdf ->
+                                        val pdfStatus = liveState?.localPdfStatuses?.get(pdf.id) ?: LocalPdfStatus.NotDownloaded
+                                        StudentLessonPdfCard(
+                                            pdf = pdf,
+                                            status = pdfStatus,
+                                            onDownload = { targetPdf ->
+                                                viewModel?.downloadLessonPdf(context, targetPdf)
+                                            },
+                                            onCancel = { targetPdf ->
+                                                viewModel?.cancelLessonPdfDownload(targetPdf.id)
+                                            },
+                                            onRetry = { targetPdf ->
+                                                viewModel?.downloadLessonPdf(context, targetPdf)
+                                            },
+                                            onDeleteLocal = { targetPdf ->
+                                                viewModel?.deleteLocalSecurePdf(context, targetPdf)
+                                            },
+                                            onOpenPdf = { targetPdf ->
+                                                viewModel?.openLessonPdf(context, targetPdf)
+                                            },
+                                            isOpening = liveState?.isOpeningPdf == true
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
+    }
+
+    if (showAddPdfDialog && pickedFileUri != null) {
+        AddEditLessonPdfDialog(
+            pdf = null,
+            selectedFileUri = pickedFileUri,
+            selectedFileName = pickedFileName,
+            suggestedOrder = lessonPdfs.size,
+            isOperating = isPdfOperating,
+            errorMessage = pdfError,
+            onDismiss = {
+                showAddPdfDialog = false
+                pickedFileUri = null
+                pickedFileName = null
+                viewModel?.clearPdfOperationMessages()
+            },
+            onSaveAdd = { uri, title, order, isPublished ->
+                viewModel?.uploadAndInsertLessonPdf(
+                    context = context,
+                    fileUri = uri,
+                    title = title,
+                    subjectId = lesson.subjectId,
+                    lessonId = lesson.id,
+                    orderIndex = order,
+                    isPublished = isPublished
+                ) { result ->
+                    if (result.isSuccess) {
+                        showAddPdfDialog = false
+                        pickedFileUri = null
+                        pickedFileName = null
+                    }
+                }
+            },
+            onSaveEdit = { _, _, _, _ -> }
+        )
+    }
+
+    pdfToEdit?.let { targetPdf ->
+        AddEditLessonPdfDialog(
+            pdf = targetPdf,
+            suggestedOrder = targetPdf.orderIndex,
+            isOperating = isPdfOperating,
+            errorMessage = pdfError,
+            onDismiss = {
+                pdfToEdit = null
+                viewModel?.clearPdfOperationMessages()
+            },
+            onSaveAdd = { _, _, _, _ -> },
+            onSaveEdit = { pdfId, title, order, isPublished ->
+                viewModel?.updateLessonPdfDetails(
+                    pdfId = pdfId,
+                    title = title,
+                    isPublished = isPublished,
+                    orderIndex = order,
+                    lessonId = lesson.id
+                ) { result ->
+                    if (result.isSuccess) {
+                        pdfToEdit = null
+                    }
+                }
+            }
+        )
     }
 }
 

@@ -5,11 +5,14 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.AuthSession
 import com.example.data.PdfSecurityStorageService
 import com.example.data.SessionManager
+import com.example.data.SupabaseDatabaseService
 import com.example.data.SupabaseStorageService
 import com.example.model.LessonPdf
+import com.example.model.Subject
 import com.example.model.SupabaseConfig
 import com.example.viewmodel.AppViewModel
 import com.example.viewmodel.LocalPdfStatus
+import com.example.viewmodel.UserRole
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +58,26 @@ class AppViewModelPdfDownloadUnitTest {
     private lateinit var context: Context
     private lateinit var testSecretKey: SecretKey
 
+    private val defaultTestSubject = Subject(
+        id = "subject_1",
+        name = "Test Subject",
+        academicYear = 1,
+        semester = 1,
+        pricePoints = 0,
+        isPublished = true
+    )
+
+    private fun createConfiguredViewModel(
+        role: UserRole = UserRole.STUDENT,
+        subjects: List<Subject> = listOf(defaultTestSubject),
+        enrolledSubjectIds: Set<String> = emptySet()
+    ): AppViewModel {
+        val vm = AppViewModel()
+        vm.setTestRole(role)
+        vm.setTestSubjects(subjects, enrolledSubjectIds)
+        return vm
+    }
+
     private fun createValidPdfBytes(text: String = "Test PDF Content"): ByteArray {
         return byteArrayOf(0x25, 0x50, 0x44, 0x46, 0x2D) + "1.7\n$text\n%%EOF".toByteArray(Charsets.UTF_8)
     }
@@ -65,7 +88,9 @@ class AppViewModelPdfDownloadUnitTest {
         subjectId: String = "subject_1",
         title: String = "Test PDF",
         filePath: String = "test/path.pdf",
-        fileSizeBytes: Long? = 100L
+        fileSizeBytes: Long? = 100L,
+        orderIndex: Int = 0,
+        isPublished: Boolean = true
     ): LessonPdf {
         return LessonPdf(
             id = id,
@@ -75,8 +100,8 @@ class AppViewModelPdfDownloadUnitTest {
             filePath = filePath,
             fileSizeBytes = fileSizeBytes,
             mimeType = "application/pdf",
-            orderIndex = 0,
-            isPublished = true,
+            orderIndex = orderIndex,
+            isPublished = isPublished,
             createdAt = "2026-01-01T00:00:00Z",
             updatedAt = "2026-01-01T00:00:00Z"
         )
@@ -109,7 +134,8 @@ class AppViewModelPdfDownloadUnitTest {
 
     @After
     fun tearDown() {
-        SupabaseStorageService.testClient = null
+        com.example.data.SupabaseStorageService.testClient = null
+        SupabaseDatabaseService.testClient = null
         SessionManager.clearSession()
     }
 
@@ -137,7 +163,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val lessonPdf = createTestLessonPdf(
                 id = pdfId,
@@ -199,7 +225,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val lessonPdf = createTestLessonPdf(
                 id = pdfId,
@@ -267,7 +293,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val lessonPdf = createTestLessonPdf(
                 id = pdfId,
@@ -335,7 +361,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val lessonPdf = createTestLessonPdf(
                 id = pdfId,
@@ -393,7 +419,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val lessonPdf = createTestLessonPdf(
                 id = pdfId,
@@ -497,7 +523,7 @@ class AppViewModelPdfDownloadUnitTest {
         runBlocking {
             saveTestSession(userId = "user_traversal", token = "token_trav")
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val invalidPdf = createTestLessonPdf(
                 id = "../../bad_id",
                 lessonId = "lesson_bad",
@@ -521,7 +547,7 @@ class AppViewModelPdfDownloadUnitTest {
     fun testDownloadFailsWhenNoSession() {
         runBlocking {
             SessionManager.clearSession()
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(
                 id = pdfId,
@@ -563,7 +589,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(
                 id = pdfId,
@@ -623,7 +649,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(
                 id = pdfId,
@@ -680,7 +706,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(
                 id = pdfId,
@@ -752,7 +778,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(
                 id = pdfId,
@@ -826,7 +852,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId1 = UUID.randomUUID().toString()
             val pdf1 = createTestLessonPdf(id = pdfId1, title = "PDF 1")
 
@@ -889,7 +915,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Switch PDF", fileSizeBytes = pdfBytes.size.toLong())
 
@@ -964,7 +990,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Purge PDF", fileSizeBytes = pdfBytes.size.toLong())
 
@@ -1025,7 +1051,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Redownload PDF", fileSizeBytes = pdfBytes.size.toLong())
 
@@ -1096,7 +1122,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfs = (1..6).map {
                 createTestLessonPdf(id = UUID.randomUUID().toString(), title = "PDF $it")
             }
@@ -1156,7 +1182,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Progress PDF")
 
@@ -1212,7 +1238,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Error PDF")
 
@@ -1261,7 +1287,7 @@ class AppViewModelPdfDownloadUnitTest {
                 .build()
             SupabaseStorageService.testClient = mockClient
 
-            val viewModel = AppViewModel()
+            val viewModel = createConfiguredViewModel()
             val pdfId = UUID.randomUUID().toString()
             val pdf = createTestLessonPdf(id = pdfId, title = "Clean Map PDF", fileSizeBytes = pdfBytes.size.toLong())
 
@@ -1276,5 +1302,443 @@ class AppViewModelPdfDownloadUnitTest {
             assertTrue(viewModel.uiState.value.localPdfStatuses[pdfId] is LocalPdfStatus.Downloaded)
             assertEquals("يجب أن تكون خريطة المهام فارغة تماماً بعد الاكتمال", 0, viewModel.getActiveJobsCount())
         }
+    }
+
+    // =========================================================================
+    // Phase 1 New Unit Tests: Metadata Update & Student Access Gate
+    // =========================================================================
+
+    /**
+     * 1. نجاح تحديث metadata عند استجابة صحيحة من الخادم تحتوي على سجل محدث
+     */
+    @Test
+    fun testUpdateLessonPdfSuccess() = runBlocking {
+        val pdfId = UUID.randomUUID().toString()
+        val mockResponseJson = """
+            [{
+                "id": "$pdfId",
+                "lesson_id": "lesson_1",
+                "subject_id": "subject_1",
+                "title": "العنوان المحدث للدرس",
+                "file_path": "subject_1/lesson_1/$pdfId.pdf",
+                "file_size_bytes": 2048,
+                "mime_type": "application/pdf",
+                "order_index": 3,
+                "is_published": true,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T12:00:00Z"
+            }]
+        """.trimIndent()
+
+        SupabaseDatabaseService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                assertEquals("PATCH", req.method)
+                assertTrue(req.url.toString().contains("id=eq.$pdfId"))
+                assertEquals("return=representation", req.header("Prefer"))
+                assertEquals("Bearer test_jwt_token", req.header("Authorization"))
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/json")
+                    .body(mockResponseJson.toResponseBody("application/json".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val result = SupabaseDatabaseService.updateLessonPdf(
+            pdfId = pdfId,
+            title = "العنوان المحدث للدرس",
+            isPublished = true,
+            orderIndex = 3,
+            accessToken = "test_jwt_token",
+            config = SupabaseConfig(projectUrl = "https://example.supabase.co", anonKey = "anon_key")
+        )
+
+        assertTrue("يجب أن تنجح عملية التحديث عند عودة 200 مع تمثيل السجل", result.isSuccess)
+        val updated = result.getOrThrow()
+        assertEquals(pdfId, updated.id)
+        assertEquals("العنوان المحدث للدرس", updated.title)
+        assertTrue(updated.isPublished)
+        assertEquals(3, updated.orderIndex)
+    }
+
+    /**
+     * 2. رفض التحديث فوراً عند غياب Access Token
+     */
+    @Test
+    fun testUpdateLessonPdfRejectsEmptyAccessToken() = runBlocking {
+        val pdfId = UUID.randomUUID().toString()
+        val result = SupabaseDatabaseService.updateLessonPdf(
+            pdfId = pdfId,
+            title = "عنوان جديد",
+            isPublished = true,
+            orderIndex = 0,
+            accessToken = "",
+            config = SupabaseConfig(projectUrl = "https://example.supabase.co", anonKey = "anon_key")
+        )
+
+        assertTrue("يجب رفض التحديث عند غياب accessToken", result.isFailure)
+        val msg = result.exceptionOrNull()?.message.orEmpty()
+        assertTrue("يجب أن تشير رسالة الخطأ إلى رمز الوصول: $msg", msg.contains("accessToken"))
+    }
+
+    /**
+     * 3. معالجة أخطاء HTTP الواردة من Supabase برسائل واضحة
+     */
+    @Test
+    fun testUpdateLessonPdfHttpError() = runBlocking {
+        val pdfId = UUID.randomUUID().toString()
+        SupabaseDatabaseService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(403)
+                    .message("Forbidden")
+                    .body("{\"message\":\"permission denied\"}".toResponseBody("application/json".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val result = SupabaseDatabaseService.updateLessonPdf(
+            pdfId = pdfId,
+            title = "عنوان",
+            isPublished = true,
+            orderIndex = 0,
+            accessToken = "token",
+            config = SupabaseConfig(projectUrl = "https://example.supabase.co", anonKey = "anon_key")
+        )
+
+        assertTrue(result.isFailure)
+        val msg = result.exceptionOrNull()?.message.orEmpty()
+        assertTrue("يجب أن تحتوي رسالة الخطأ على رمز 403 أو رفض الوصول: $msg", msg.contains("403") || msg.contains("رفض"))
+    }
+
+    /**
+     * 4. منع الطالب من تنزيل ملف غير منشور (is_published = false)
+     */
+    @Test
+    fun testStudentCannotDownloadUnpublishedPdf() = runBlocking {
+        val userId = "student_user_1"
+        saveTestSession(userId = userId, token = "student_token")
+
+        val viewModel = createConfiguredViewModel(role = UserRole.STUDENT)
+        val pdfId = UUID.randomUUID().toString()
+        val unpublishedPdf = createTestLessonPdf(id = pdfId, isPublished = false)
+
+        viewModel.downloadLessonPdf(context, unpublishedPdf)
+
+        val status = viewModel.uiState.value.localPdfStatuses[pdfId]
+        assertTrue("يجب تسجيل حالة خطأ عند محاولة تنزيل ملف غير منشور", status is LocalPdfStatus.Error)
+        val errMsg = (status as LocalPdfStatus.Error).message
+        assertTrue("يجب أن توضح الرسالة أن الملف غير منشور: $errMsg", errMsg.contains("غير منشور"))
+    }
+
+    /**
+     * 5. منع الطالب من تنزيل ملف دون صلاحية الوصول (مادة مدفوعة والطالب غير مشترك)
+     */
+    @Test
+    fun testStudentCannotDownloadPaidUnenrolledPdf() = runBlocking {
+        val userId = "student_user_2"
+        saveTestSession(userId = userId, token = "student_token")
+
+        val paidSubject = Subject(
+            id = "paid_subject_1",
+            name = "مادة مدفوعة",
+            academicYear = 1,
+            semester = 1,
+            pricePoints = 500,
+            isPublished = true
+        )
+
+        val viewModel = createConfiguredViewModel(
+            role = UserRole.STUDENT,
+            subjects = listOf(paidSubject),
+            enrolledSubjectIds = emptySet()
+        )
+
+        val pdfId = UUID.randomUUID().toString()
+        val pdf = createTestLessonPdf(id = pdfId, subjectId = "paid_subject_1", isPublished = true)
+
+        viewModel.downloadLessonPdf(context, pdf)
+
+        val status = viewModel.uiState.value.localPdfStatuses[pdfId]
+        assertTrue("يجب رفض التنزيل للطالب غير المشترك", status is LocalPdfStatus.Error)
+        val errMsg = (status as LocalPdfStatus.Error).message
+        assertTrue("يجب أن تشير الرسالة إلى ضرورة الاشتراك: $errMsg", errMsg.contains("الاشتراك"))
+    }
+
+    /**
+     * 6. السماح بالوصول وتنزيل المادة المجانية (pricePoints == 0) وفق المنطق الحالي
+     */
+    @Test
+    fun testStudentCanDownloadFreePublishedPdf() = runBlocking {
+        val userId = "student_user_3"
+        saveTestSession(userId = userId, token = "student_token")
+
+        val pdfBytes = createValidPdfBytes("Free Math Lesson")
+        com.example.data.SupabaseStorageService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/pdf")
+                    .body(pdfBytes.toResponseBody("application/pdf".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val freeSubject = Subject(
+            id = "free_subject_1",
+            name = "مادة مجانية",
+            academicYear = 1,
+            semester = 1,
+            pricePoints = 0,
+            isPublished = true
+        )
+
+        val viewModel = createConfiguredViewModel(
+            role = UserRole.STUDENT,
+            subjects = listOf(freeSubject),
+            enrolledSubjectIds = emptySet()
+        )
+
+        val pdfId = UUID.randomUUID().toString()
+        val pdf = createTestLessonPdf(id = pdfId, subjectId = "free_subject_1", isPublished = true)
+
+        viewModel.downloadLessonPdf(context, pdf)
+
+        var retries = 0
+        while (viewModel.uiState.value.localPdfStatuses[pdfId] !is LocalPdfStatus.Downloaded && retries < 40) {
+            delay(25)
+            retries++
+        }
+
+        val status = viewModel.uiState.value.localPdfStatuses[pdfId]
+        assertTrue("يجب أن ينجح تنزيل ملف المادة المجانية: $status", status is LocalPdfStatus.Downloaded)
+    }
+
+    /**
+     * 7. منع غير المشرف (الطالب) من تحديث بيانات ملف الـ PDF الوصفية
+     */
+    @Test
+    fun testNonAdminCannotUpdateLessonPdfDetails() = runBlocking {
+        val userId = "student_user_4"
+        saveTestSession(userId = userId, token = "student_token")
+
+        val viewModel = createConfiguredViewModel(role = UserRole.STUDENT)
+        val pdfId = UUID.randomUUID().toString()
+
+        var callResult: Result<LessonPdf>? = null
+        viewModel.updateLessonPdfDetails(
+            pdfId = pdfId,
+            title = "تعديل غير مسموح به",
+            isPublished = true,
+            orderIndex = 1
+        ) { res ->
+            callResult = res
+        }
+
+        assertNotNull(callResult)
+        assertTrue("يجب أن تفشل محاولة تعديل بيانات الملف لغير المشرف", callResult!!.isFailure)
+        val err = callResult!!.exceptionOrNull()?.message.orEmpty()
+        assertTrue("يجب أن تشير الرسالة إلى صلاحية المشرف: $err", err.contains("المشرف"))
+        assertEquals(err, viewModel.uiState.value.pdfOperationError)
+    }
+
+    /**
+     * 8. منع تكرار تحديث الملف نفسه بالتزامن
+     */
+    @Test
+    fun testConcurrentUpdateOnSamePdfIsRejected() = runBlocking {
+        val adminId = "admin_user_1"
+        saveTestSession(userId = adminId, token = "admin_token")
+
+        val latchProceed = CountDownLatch(1)
+        val latchStarted = CountDownLatch(1)
+
+        SupabaseDatabaseService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                latchStarted.countDown()
+                latchProceed.await(2, TimeUnit.SECONDS)
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""[{"id":"test_pdf","lesson_id":"lesson_1","subject_id":"sub_1","title":"Title","file_path":"f.pdf","file_size_bytes":10,"mime_type":"application/pdf","order_index":0,"is_published":true,"created_at":"","updated_at":""}]""".toResponseBody("application/json".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val viewModel = createConfiguredViewModel(role = UserRole.ADMIN)
+        val pdfId = UUID.randomUUID().toString()
+
+        // الطلب الأول
+        viewModel.updateLessonPdfDetails(
+            pdfId = pdfId,
+            title = "First Update",
+            isPublished = true,
+            orderIndex = 1
+        )
+
+        assertTrue(latchStarted.await(2, TimeUnit.SECONDS))
+
+        // محاولة إطلاق تحديث ثانٍ لنفس الملف أثناء جريان الأول
+        var secondResult: Result<LessonPdf>? = null
+        viewModel.updateLessonPdfDetails(
+            pdfId = pdfId,
+            title = "Second Concurrent Update",
+            isPublished = false,
+            orderIndex = 2
+        ) { res ->
+            secondResult = res
+        }
+
+        assertNotNull("يجب أن يعيد التحديث الثاني المتزامن نتيجة فورية", secondResult)
+        assertTrue("يجب رفض التحديث المتزامن لنفس الملف", secondResult!!.isFailure)
+        val errMsg = secondResult!!.exceptionOrNull()?.message.orEmpty()
+        assertTrue("يجب أن توضح الرسالة وجود عملية تحديث جارية للملف: $errMsg", errMsg.contains("تحديث جارية"))
+
+        latchProceed.countDown()
+    }
+
+    /**
+     * 9. عدم تغيير حالة الملفات في الذاكرة عند فشل التحديث من الخادم
+     */
+    @Test
+    fun testFailedUpdateDoesNotChangeMemoryState() = runBlocking {
+        val adminId = "admin_user_2"
+        saveTestSession(userId = adminId, token = "admin_token")
+
+        SupabaseDatabaseService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(500)
+                    .message("Internal Server Error")
+                    .body("{\"error\":\"server down\"}".toResponseBody("application/json".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val viewModel = createConfiguredViewModel(role = UserRole.ADMIN)
+        val pdfId = UUID.randomUUID().toString()
+        val originalPdf = createTestLessonPdf(id = pdfId, title = "Original Title", isPublished = false, orderIndex = 1)
+
+        // إدخال الملف الأصلي في ذاكرة الـ ViewModel
+        viewModel.setTestLessonPdfs(lessonId = "lesson_1", pdfs = listOf(originalPdf))
+
+        var updateResult: Result<LessonPdf>? = null
+        viewModel.updateLessonPdfDetails(
+            pdfId = pdfId,
+            title = "Attempted Title",
+            isPublished = true,
+            orderIndex = 99,
+            lessonId = "lesson_1"
+        ) { res ->
+            updateResult = res
+        }
+
+        var retries = 0
+        while (updateResult == null && retries < 40) {
+            delay(25)
+            retries++
+        }
+
+        assertNotNull(updateResult)
+        assertTrue(updateResult!!.isFailure)
+
+        val currentPdfs = viewModel.uiState.value.lessonPdfsByLesson["lesson_1"].orEmpty()
+        assertEquals(1, currentPdfs.size)
+        val preservedPdf = currentPdfs.first()
+        assertEquals("Original Title", preservedPdf.title)
+        assertFalse(preservedPdf.isPublished)
+        assertEquals(1, preservedPdf.orderIndex)
+    }
+
+    /**
+     * 10. إعطاء الأولوية لمعرف الدرس الصادر من الخادم (updatedPdf.lessonId) وتطهير أي درس سابق غير مطابق
+     */
+    @Test
+    fun testUpdateLessonPdfPrioritizesServerLessonIdOverMismatchedCallerLessonId() = runBlocking {
+        val adminId = "admin_user_3"
+        saveTestSession(userId = adminId, token = "admin_token")
+
+        val pdfId = UUID.randomUUID().toString()
+        val serverLessonId = "lesson_server_authoritative"
+        val mismatchedCallerLessonId = "lesson_mismatched_caller"
+
+        // الخادم يجيب بتمثيل يحتوي على serverLessonId كمعرف أصلي للدرس
+        SupabaseDatabaseService.testClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("""
+                        [{
+                            "id": "$pdfId",
+                            "lesson_id": "$serverLessonId",
+                            "subject_id": "subject_1",
+                            "title": "Title From Server",
+                            "file_path": "path.pdf",
+                            "file_size_bytes": 100,
+                            "mime_type": "application/pdf",
+                            "order_index": 1,
+                            "is_published": true,
+                            "created_at": "2026-01-01T00:00:00Z",
+                            "updated_at": "2026-01-01T12:00:00Z"
+                        }]
+                    """.trimIndent().toResponseBody("application/json".toMediaTypeOrNull()))
+                    .build()
+            }.build()
+
+        val viewModel = createConfiguredViewModel(role = UserRole.ADMIN)
+        val originalPdf = createTestLessonPdf(
+            id = pdfId,
+            lessonId = mismatchedCallerLessonId,
+            title = "Old Title",
+            isPublished = false,
+            orderIndex = 0
+        )
+
+        // إدخال الملف مبدئياً تحت الدرس الخاطئ لمحاكاة خطأ الواجهة
+        viewModel.setTestLessonPdfs(lessonId = mismatchedCallerLessonId, pdfs = listOf(originalPdf))
+
+        var updateResult: Result<LessonPdf>? = null
+        viewModel.updateLessonPdfDetails(
+            pdfId = pdfId,
+            title = "Title From Server",
+            isPublished = true,
+            orderIndex = 1,
+            lessonId = mismatchedCallerLessonId // الواجهة مررت معرفاً غير مطابق
+        ) { res ->
+            updateResult = res
+        }
+
+        var retries = 0
+        while (updateResult == null && retries < 40) {
+            delay(25)
+            retries++
+        }
+
+        assertNotNull(updateResult)
+        assertTrue(updateResult!!.isSuccess)
+
+        val state = viewModel.uiState.value
+        // يجب أن يُمسح الملف من الدرس الخاطئ
+        val mismatchedList = state.lessonPdfsByLesson[mismatchedCallerLessonId].orEmpty()
+        assertTrue("يجب مسح الملف من الدرس الخاطئ الممرر من الواجهة", mismatchedList.none { it.id == pdfId })
+
+        // يجب أن يُوضع الملف تحت الدرس المعتمد القادم من الخادم
+        val authoritativeList = state.lessonPdfsByLesson[serverLessonId].orEmpty()
+        assertEquals(1, authoritativeList.size)
+        val correctPdf = authoritativeList.first()
+        assertEquals(pdfId, correctPdf.id)
+        assertEquals(serverLessonId, correctPdf.lessonId)
+        assertEquals("Title From Server", correctPdf.title)
     }
 }

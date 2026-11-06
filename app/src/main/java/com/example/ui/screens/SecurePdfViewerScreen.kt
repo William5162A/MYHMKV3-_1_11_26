@@ -13,7 +13,13 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -34,12 +40,16 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
@@ -61,6 +71,7 @@ import com.example.ui.theme.DeepNavy
 import com.example.ui.theme.EmeraldMint
 import com.example.ui.theme.LightBackground
 import com.example.viewmodel.ActivePdfSession
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -70,9 +81,12 @@ import kotlinx.coroutines.launch
  * 1. تفعيل حماية FLAG_SECURE أثناء عرض المستند فقط واستعادة الحالة الأصلية بدقة عند الخروج.
  * 2. قراءة المستند من الملف المؤقت المفكوك دون إنشاء أي نسخ أخرى.
  * 3. عرض الصفحات بتمرير رأسي متتابع مع تحميل متأخر (Lazy Loading) عبر PdfRenderEngine.
- * 4. تكبير وتحريك مستقل لكل صفحة دون التأثير على بقية المستند.
+ * 4. تكبير وتصغير للمستند كله بإصبعين أو بالنقر المزدوج، مع تمرير طبيعي وإعادة رسم بدقة أعلى عند التكبير.
  * 5. واجهة عربية RTL متكاملة مع الوضعين الفاتح والداكن وخطوط مِداد.
  */
+private const val MAX_PDF_ZOOM = 4f
+private const val DOUBLE_TAP_ZOOM = 2.5f
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SecurePdfViewerScreen(
@@ -134,6 +148,42 @@ fun SecurePdfViewerScreen(
 
     val pageCount = renderEngine.pageCount
     val listState = rememberLazyListState()
+
+    // حالة التكبير للمستند كله (تكبير واحد لكل الصفحات كما في أي قارئ PDF)
+    var zoomScale by remember { mutableFloatStateOf(1f) }
+    var zoomOffsetX by remember { mutableFloatStateOf(0f) }
+    var settledScale by remember { mutableFloatStateOf(1f) }
+    var viewportWidthPx by remember { mutableIntStateOf(0) }
+    var viewportHeightPx by remember { mutableIntStateOf(0) }
+
+    // بعد توقف الأصابع نعيد رسم الصفحات بدقة أعلى ليبقى النص حادًا
+    LaunchedEffect(zoomScale) {
+        delay(350)
+        settledScale = zoomScale
+    }
+    val renderScale = when {
+        settledScale <= 1.3f -> 1f
+        settledScale <= 2.2f -> 2f
+        else -> 3f
+    }
+
+    // تطبيق تكبير/تصغير حول نقطة (cx, cy) مع تحريك (panX, panY) بوحدات الشاشة
+    fun applyZoom(requestedScale: Float, cx: Float, cy: Float, panX: Float, panY: Float) {
+        val oldScale = zoomScale
+        val newScale = requestedScale.coerceIn(1f, MAX_PDF_ZOOM)
+        val viewW = viewportWidthPx.toFloat()
+
+        // الاتجاه الرأسي: نبقي النقطة تحت الأصابع ثابتة عبر تمرير القائمة نفسها
+        val deltaY = (cy / oldScale) - (cy / newScale) - (panY / newScale)
+        if (deltaY != 0f) {
+            listState.dispatchRawDelta(deltaY)
+        }
+
+        // الاتجاه الأفقي: إزاحة مقيّدة بحدود الصفحة
+        val rawOffsetX = cx - (cx - zoomOffsetX) * (newScale / oldScale) + panX
+        zoomOffsetX = rawOffsetX.coerceIn(viewW * (1f - newScale), 0f)
+        zoomScale = newScale
+    }
 
     // تتبع رقم الصفحة الحالية (1-based)
     val currentPageIndex by remember {
@@ -235,27 +285,102 @@ fun SecurePdfViewerScreen(
                         )
                     }
                 } else {
-                    LazyColumn(
-                        state = listState,
+                    // ارتفاع إضافي أسفل القائمة كي يمكن الوصول لنهاية آخر صفحة عند التكبير
+                    val extraBottomPadding = with(LocalDensity.current) {
+                        (viewportHeightPx * (1f - 1f / zoomScale)).coerceAtLeast(0f).toDp()
+                    }
+
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .testTag("pdf_pages_lazy_column"),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                            .clipToBounds()
+                            .onSizeChanged { size ->
+                                viewportWidthPx = size.width
+                                viewportHeightPx = size.height
+                            }
+                            // النقر المزدوج: تكبير حول مكان النقر أو العودة للحجم الطبيعي
+                            .pointerInput(Unit) {
+                                detectTapGestures(
+                                    onDoubleTap = { tapPosition ->
+                                        coroutineScope.launch {
+                                            val from = zoomScale
+                                            val to = if (from > 1.05f) 1f else DOUBLE_TAP_ZOOM
+                                            animate(
+                                                initialValue = from,
+                                                targetValue = to,
+                                                animationSpec = tween(durationMillis = 220)
+                                            ) { value, _ ->
+                                                applyZoom(value, tapPosition.x, tapPosition.y, 0f, 0f)
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+                            // التكبير بإصبعين، وتحريك أفقي بإصبع واحد عند التكبير.
+                            // الإصبع الواحد لا يُستهلك فيبقى التمرير الرأسي أصليًا من القائمة.
+                            .pointerInput(Unit) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                                    do {
+                                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                                        val pressedCount = event.changes.count { it.pressed }
+                                        if (pressedCount >= 2) {
+                                            val zoom = event.calculateZoom()
+                                            val pan = event.calculatePan()
+                                            val centroid = event.calculateCentroid()
+                                            if (zoom != 1f || pan != Offset.Zero) {
+                                                applyZoom(zoomScale * zoom, centroid.x, centroid.y, pan.x, pan.y)
+                                            }
+                                            event.changes.forEach { change ->
+                                                if (change.positionChanged()) change.consume()
+                                            }
+                                        } else if (pressedCount == 1 && zoomScale > 1.001f) {
+                                            val change = event.changes.firstOrNull { it.pressed }
+                                            if (change != null) {
+                                                val dx = change.position.x - change.previousPosition.x
+                                                if (dx != 0f) {
+                                                    applyZoom(zoomScale, 0f, 0f, dx, 0f)
+                                                }
+                                            }
+                                        }
+                                    } while (event.changes.any { it.pressed })
+                                }
+                            }
                     ) {
-                        items(
-                            count = pageCount,
-                            key = { pageIdx -> "pdf_page_$pageIdx" }
-                        ) { pageIndex ->
-                            PdfPageCard(
-                                pageIndex = pageIndex,
-                                renderEngine = renderEngine,
-                                isDarkMode = isDarkMode,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("pdf_page_item_$pageIndex")
-                            )
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .testTag("pdf_pages_lazy_column")
+                                .graphicsLayer {
+                                    transformOrigin = TransformOrigin(0f, 0f)
+                                    scaleX = zoomScale
+                                    scaleY = zoomScale
+                                    translationX = zoomOffsetX
+                                },
+                            contentPadding = PaddingValues(
+                                start = 8.dp,
+                                end = 8.dp,
+                                top = 12.dp,
+                                bottom = 12.dp + extraBottomPadding
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            items(
+                                count = pageCount,
+                                key = { pageIdx -> "pdf_page_$pageIdx" }
+                            ) { pageIndex ->
+                                PdfPageCard(
+                                    pageIndex = pageIndex,
+                                    renderEngine = renderEngine,
+                                    renderScale = renderScale,
+                                    isDarkMode = isDarkMode,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("pdf_page_item_$pageIndex")
+                                )
+                            }
                         }
                     }
 
@@ -319,16 +444,18 @@ fun SecurePdfViewerScreen(
 }
 
 /**
- * مكون البطاقة الخاصة برسم الصفحة الواحدة مع دعم التكبير والتحريك المستقل (Pinch to Zoom & Pan)
+ * مكون البطاقة الخاصة برسم الصفحة الواحدة.
+ * التكبير والتحريك يُدار على مستوى المستند كله (في SecurePdfViewerScreen)،
+ * وهنا نعيد رسم الصفحة بدقة أعلى فقط عندما يستقر التكبير.
  */
 @Composable
 fun PdfPageCard(
     pageIndex: Int,
     renderEngine: PdfRenderEngine,
+    renderScale: Float,
     isDarkMode: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val density = LocalDensity.current
     var containerWidthPx by remember { mutableIntStateOf(0) }
     var aspectRatio by remember { mutableFloatStateOf(0.707f) }
 
@@ -336,22 +463,19 @@ fun PdfPageCard(
     var isLoading by remember { mutableStateOf(true) }
     var isError by remember { mutableStateOf(false) }
 
-    // حالات التكبير والتحريك المستقلة لهذه الصفحة
-    var scale by rememberSaveable { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
-    var pageContentSize by remember { mutableStateOf(IntSize.Zero) }
-
     // جلب النسبة الباعية للصفحة
     LaunchedEffect(pageIndex) {
         aspectRatio = renderEngine.getPageAspectRatio(pageIndex)
     }
 
-    // رسم الصفحة عندما يتوفر عرض الحاوية
-    LaunchedEffect(pageIndex, containerWidthPx) {
+    // رسم الصفحة عندما يتوفر عرض الحاوية (وإعادة الرسم بدقة أعلى عند التكبير)
+    LaunchedEffect(pageIndex, containerWidthPx, renderScale) {
         if (containerWidthPx <= 0) return@LaunchedEffect
 
+        val targetWidth = (containerWidthPx * renderScale).toInt()
+
         // فحص الكاش أولاً
-        val cached = renderEngine.getCachedPage(pageIndex)
+        val cached = renderEngine.getCachedPage(pageIndex, targetWidth)
         if (cached != null && !cached.isRecycled) {
             renderedBitmap = cached
             isLoading = false
@@ -359,16 +483,17 @@ fun PdfPageCard(
             return@LaunchedEffect
         }
 
+        // نُبقي الصورة السابقة ظاهرة أثناء رسم النسخة الأوضح
         isLoading = true
         isError = false
-        val result = renderEngine.renderPage(pageIndex, containerWidthPx)
+        val result = renderEngine.renderPage(pageIndex, targetWidth)
         if (result.isSuccess) {
             renderedBitmap = result.getOrNull()
             isLoading = false
             isError = false
         } else {
             isLoading = false
-            isError = true
+            if (renderedBitmap == null) isError = true
         }
     }
 
@@ -387,44 +512,7 @@ fun PdfPageCard(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .aspectRatio(aspectRatio)
-                .onSizeChanged { pageContentSize = it }
-                .pointerInput(Unit) {
-                    // النقر المزدوج للتبديل بين الحجم الطبيعي 1x والتكبير 2.5x
-                    detectTapGestures(
-                        onDoubleTap = {
-                            if (scale > 1.05f) {
-                                scale = 1f
-                                offset = Offset.Zero
-                            } else {
-                                scale = 2.5f
-                            }
-                        }
-                    )
-                }
-                .pointerInput(scale) {
-                    // التكبير بإصبعين والتحريك
-                    detectTransformGestures { _, pan, zoom, _ ->
-                        val newScale = (scale * zoom).coerceIn(1f, 3.5f)
-                        scale = newScale
-
-                        if (newScale > 1.05f) {
-                            // تقييد إزاحة الصفحة حتى لا تخرج عن حواف العرض
-                            val maxOffsetX = (pageContentSize.width * (newScale - 1f)) / 2f
-                            val maxOffsetY = (pageContentSize.height * (newScale - 1f)) / 2f
-
-                            val rawX = offset.x + pan.x
-                            val rawY = offset.y + pan.y
-
-                            offset = Offset(
-                                x = rawX.coerceIn(-maxOffsetX, maxOffsetX),
-                                y = rawY.coerceIn(-maxOffsetY, maxOffsetY)
-                            )
-                        } else {
-                            offset = Offset.Zero
-                        }
-                    }
-                },
+                .aspectRatio(aspectRatio),
             contentAlignment = Alignment.Center
         ) {
             val bitmap = renderedBitmap
@@ -433,14 +521,7 @@ fun PdfPageCard(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = "صفحة رقم ${pageIndex + 1}",
                     contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .graphicsLayer {
-                            scaleX = scale
-                            scaleY = scale
-                            translationX = offset.x
-                            translationY = offset.y
-                        }
+                    modifier = Modifier.fillMaxSize()
                 )
             } else if (isLoading) {
                 Column(

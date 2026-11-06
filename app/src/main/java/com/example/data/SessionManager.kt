@@ -142,13 +142,11 @@ object SessionManager {
 
         try {
             val secretKey = getOrCreateEnrollmentsSecretKey()
-            val iv = ByteArray(GCM_IV_LENGTH_BYTES)
-            SecureRandom().nextBytes(iv)
 
             val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-            val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, spec)
-
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)   // النظام يولّد IV تلقائيًا
+            val iv = cipher.iv
+            check(iv.size == GCM_IV_LENGTH_BYTES) { "طول IV غير متوقع: ${iv.size}" }
             // ربط مشفر البيانات بهوية المستخدم الحالي عبر AAD لمنع نقل التشفير لمستخدم آخر
             cipher.updateAAD(cleanUserId.toByteArray(Charsets.UTF_8))
 

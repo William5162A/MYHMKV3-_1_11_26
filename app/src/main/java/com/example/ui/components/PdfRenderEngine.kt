@@ -29,6 +29,8 @@ class PdfRenderEngine(
 ) {
     companion object {
         private const val TAG = "PdfRenderEngine"
+        // أقصى عرض للصورة المرسومة (يسمح بوضوح جيد عند التكبير دون استهلاك مفرط للذاكرة)
+        private const val MAX_RENDER_WIDTH_PX = 2400
         // نسبة الذاكرة المخصصة لكاش صفحات الـ PDF (تقريباً 20% من الذاكرة المتاحة بحدود آمنة)
         private val MAX_CACHE_MEMORY_BYTES = run {
             val maxMemory = Runtime.getRuntime().maxMemory()
@@ -49,11 +51,17 @@ class PdfRenderEngine(
     private val pageAspectRatios = mutableMapOf<Int, Float>()
 
     // ذاكرة كاش محددة بالبايتات لصور الصفحات المرسومة
-    private val bitmapCache = object : LruCache<Int, Bitmap>((MAX_CACHE_MEMORY_BYTES / 1024).toInt()) {
-        override fun sizeOf(key: Int, value: Bitmap): Int {
+    // المفتاح = (رقم الصفحة + عرض الرسم) كي لا تختلط الصورة العادية بالصورة عالية الدقة عند التكبير
+    private val bitmapCache = object : LruCache<Long, Bitmap>((MAX_CACHE_MEMORY_BYTES / 1024).toInt()) {
+        override fun sizeOf(key: Long, value: Bitmap): Int {
             return value.byteCount / 1024
         }
     }
+
+    private fun cacheKey(pageIndex: Int, width: Int): Long =
+        (pageIndex.toLong() shl 32) or (width.toLong() and 0xFFFFFFFFL)
+
+    private fun clampWidth(targetWidth: Int): Int = targetWidth.coerceIn(200, MAX_RENDER_WIDTH_PX)
 
     init {
         if (!pdfFile.exists() || !pdfFile.isFile) {
@@ -119,9 +127,9 @@ class PdfRenderEngine(
     /**
      * جلب الصفحة المرسومة من الكاش إن وجدت فوراً
      */
-    fun getCachedPage(pageIndex: Int): Bitmap? {
+    fun getCachedPage(pageIndex: Int, targetWidth: Int): Bitmap? {
         if (isClosed) return null
-        return bitmapCache.get(pageIndex)
+        return bitmapCache.get(cacheKey(pageIndex, clampWidth(targetWidth)))
     }
 
     /**
@@ -137,8 +145,11 @@ class PdfRenderEngine(
             return Result.failure(IllegalStateException("تم إغلاق محرك الـ PDF"))
         }
 
+        val finalWidth = clampWidth(targetWidth)
+        val key = cacheKey(pageIndex, finalWidth)
+
         // 1. التحقق من الكاش في الذاكرة
-        bitmapCache.get(pageIndex)?.let { cached ->
+        bitmapCache.get(key)?.let { cached ->
             if (!cached.isRecycled) {
                 return Result.success(cached)
             }
@@ -151,7 +162,7 @@ class PdfRenderEngine(
             }
 
             // فحص ثانٍ للكاش بعد كسب القفل
-            bitmapCache.get(pageIndex)?.let { cached ->
+            bitmapCache.get(key)?.let { cached ->
                 if (!cached.isRecycled) {
                     return@withLock Result.success(cached)
                 }
@@ -168,7 +179,10 @@ class PdfRenderEngine(
                         val srcWidth = page.width
                         val srcHeight = page.height
 
-                        val finalWidth = targetWidth.coerceIn(200, 2400)
+                        synchronized(pageAspectRatios) {
+                            pageAspectRatios[pageIndex] = srcWidth.toFloat() / srcHeight.toFloat()
+                        }
+
                         val finalHeight = ((finalWidth.toFloat() / srcWidth) * srcHeight).toInt().coerceAtLeast(100)
 
                         // تخصيص Bitmap مع خلفية بيضاء صافية (ضروري لأن PdfRenderer شفاف افتراضياً)
@@ -182,7 +196,7 @@ class PdfRenderEngine(
                         page.close()
 
                         if (!isClosed) {
-                            bitmapCache.put(pageIndex, bitmap)
+                            bitmapCache.put(key, bitmap)
                             Result.success(bitmap)
                         } else {
                             bitmap.recycle()
@@ -203,6 +217,29 @@ class PdfRenderEngine(
                     Log.e(TAG, "Error rendering page $pageIndex", e)
                     Result.failure(e)
                 }
+            }
+        }
+    }
+
+    /**
+     * تحميل النسب الباعية لكل الصفحات مرة واحدة لتثبيت ارتفاعات القائمة (اختياري)
+     */
+    suspend fun preloadAspectRatios() {
+        val missing = synchronized(pageAspectRatios) {
+            (0 until pageCount).filter { !pageAspectRatios.containsKey(it) }
+        }
+        if (missing.isEmpty()) return
+
+        rendererMutex.withLock {
+            val r = renderer ?: return@withLock
+            for (i in missing) {
+                if (isClosed) break
+                try {
+                    val p = r.openPage(i)
+                    val ratio = p.width.toFloat() / p.height.toFloat()
+                    p.close()
+                    synchronized(pageAspectRatios) { pageAspectRatios[i] = ratio }
+                } catch (_: Exception) {}
             }
         }
     }
@@ -232,6 +269,7 @@ class PdfRenderEngine(
             Log.w(TAG, "Error closing ParcelFileDescriptor", e)
         } finally {
             pfd = null
-        }
+        } 
     }
 }
+

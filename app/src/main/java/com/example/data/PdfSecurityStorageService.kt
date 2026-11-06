@@ -243,12 +243,15 @@ object PdfSecurityStorageService {
             val secretKey = getOrCreateSecretKey(alias)
 
             // 2. توليد IV عشوائي فريد بطول 12 بايت
-            val iv = ByteArray(GCM_IV_LENGTH_BYTES)
-            secureRandom.nextBytes(iv)
+//            val iv = ByteArray(GCM_IV_LENGTH_BYTES)
+//            secureRandom.nextBytes(iv)
 
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, parameterSpec)
+//            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+
+            val iv = cipher.iv
+            check(iv.size == GCM_IV_LENGTH_BYTES) { "طول IV غير متوقع: ${iv.size}" }
 
             FileOutputStream(tempFile).use { fos ->
                 fos.buffered().use { output ->
@@ -713,12 +716,15 @@ object PdfSecurityStorageService {
 
         try {
             val secretKey = getOrCreateSecretKey(alias)
-            val iv = ByteArray(GCM_IV_LENGTH_BYTES)
-            secureRandom.nextBytes(iv)
+//            val iv = ByteArray(GCM_IV_LENGTH_BYTES)
+//            secureRandom.nextBytes(iv)
 
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, parameterSpec)
+//            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, iv)
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
+
+            val iv = cipher.iv
+            check(iv.size == GCM_IV_LENGTH_BYTES) { "طول IV غير متوقع: ${iv.size}" }
 
             FileOutputStream(tempFile).use { fos ->
                 fos.buffered().use { output ->
@@ -1202,12 +1208,14 @@ object PdfSecurityStorageService {
 
         try {
             val secretKey = getOrCreateSecretKey(alias)
-            val finalIv = ByteArray(GCM_IV_LENGTH_BYTES)
-            secureRandom.nextBytes(finalIv)
+//            val finalIv = ByteArray(GCM_IV_LENGTH_BYTES)
+//            secureRandom.nextBytes(finalIv)
 
             val finalCipher = Cipher.getInstance(TRANSFORMATION)
-            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, finalIv)
-            finalCipher.init(Cipher.ENCRYPT_MODE, secretKey, parameterSpec)
+//            val parameterSpec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, finalIv)
+            finalCipher.init(Cipher.ENCRYPT_MODE, secretKey)
+            val finalIv = finalCipher.iv
+            check(finalIv.size == GCM_IV_LENGTH_BYTES) { "طول IV غير متوقع: ${finalIv.size}" }
 
             var hasVerifiedPdfSignature = false
             var totalBytesProcessed = 0L
